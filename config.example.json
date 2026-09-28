@@ -1,0 +1,21 @@
+{
+  "ha_url": "http://YOUR_HA_IP:8123",
+  "ha_token": "PASTE_YOUR_LONG_LIVED_TOKEN_HERE",
+  "person_entity": "person.maxwell",
+  "flight_calendar": "calendar.flighty",
+
+  "home": {"lat": 39.7392, "lon": -104.9903, "radius_km": 40, "airports": ["DEN"]},
+  "dad_name": "DADA",
+  "landed_minutes": 90,
+  "leaving_soon_hours": 4,
+  "offline_after_s": 90,
+  "temp_unit": "fahrenheit",
+  "airport_names": {},
+
+  "brightness": 60,
+  "night_brightness": 15,
+  "night_start": "20:30",
+  "night_end": "06:30",
+  "gpio_slowdown": 4,
+  "font_dir": "/home/mk/rpi-rgb-led-matrix/fonts"
+}

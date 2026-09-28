@@ -1,0 +1,5 @@
+# holds your Home Assistant token - never commit it
+config.json
+.cache/
+__pycache__/
+*.pyc
