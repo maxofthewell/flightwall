@@ -65,7 +65,7 @@ On the Pi, the app lives in `~/flightwall/` and the LED library in `~/rpi-rgb-le
 
 Screens 1–3 use the **cached calendar**, so they keep working through an HA outage. A **blinking orange 2×2 dot** in the top-right corner means a partial problem (internet down while HA is OK, a calendar error, or HA failing but still within the grace period).
 
-Other behavior: night dimming (brightness 60 → 15 from 20:30 to 06:30 Denver time); 12-hour clock; all text is uppercase ASCII (`ascii_only`).
+Other behavior: night dimming (brightness 60 → 15 from 20:30 to 06:30 Denver time); 12-hour clock (`clock_24h` switches it); `rotate` turns the whole image for sideways/upside-down mounting; poll intervals are `location_every_s` / `calendar_every_s` / `weather_every_s`; all text is uppercase ASCII (`ascii_only`).
 
 ### 64×64 layout budget
 

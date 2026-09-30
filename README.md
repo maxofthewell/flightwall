@@ -122,13 +122,17 @@ To apply changes after editing, run `sudo systemctl restart flightwall`. To see 
 | `flight_calendar` | `calendar.flighty` | Calendar with the flights |
 | `home` | Denver | `lat`, `lon`, `radius_km` (counts as home), `airports` (flights to these are "home"), `tz` |
 | `dad_name` | `DADA` | Name shown on screen |
-| `landed_minutes` | `90` | How long the "landed" screen stays up |
-| `leaving_soon_hours` | `4` | How early the "flies soon" screen starts |
+| `leaving_soon_hours` | `4` | Hours before a flight out of Denver that the "flies soon" screen starts (decimals OK, e.g. `2.5`) |
+| `landed_minutes` | `90` | Minutes after landing in Denver that the "landed" screen stays up |
+| `lookahead_days` | `90` | How far ahead to read the calendar; a flight home further out than this shows the date instead of a countdown |
 | `offline_after_s` | `90` | Seconds of failure before the offline screen appears |
 | `airport_names` | `{}` | Override city names, e.g. `{"XNA": "Bentonville"}` |
 | `temp_unit` | `fahrenheit` | Or `celsius` |
+| `clock_24h` | `false` | `true` shows 17:30 instead of 5:30 PM |
+| `location_every_s` / `calendar_every_s` / `weather_every_s` | `60` / `300` / `600` | How often to poll HA location, the flight calendar, and weather |
 | `brightness` / `night_brightness` | `60` / `15` | 0–100 |
 | `night_start` / `night_end` | `20:30` / `06:30` | Dimming window, Denver time |
+| `rotate` | `0` | `90` / `180` / `270`, clockwise, if the panel is mounted sideways or upside down |
 | `gpio_slowdown` | `4` | Lower (2–3) refreshes faster; raise it if you see sparkle or ghosting |
 | `font_dir` | `/home/mk/rpi-rgb-led-matrix/fonts` | BDF fonts from the LED library |
 | `all_events_are_flights` | `false` | Treat every calendar event as a flight |

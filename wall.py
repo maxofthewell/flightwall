@@ -4,7 +4,8 @@ FlightWall - "Where's Dada?" display for a 64x64 HUB75 LED panel.
 
 The screen is picked automatically, in this order:
   FLYING  a flight from the Flighty calendar is in progress: plane, route, progress bar
-  LANDED  a flight into Denver landed in the last 90 min: "Dada landed 12 min ago"
+  LANDED  a flight into Denver landed in the last `landed_minutes`: "Dada landed 12 min ago"
+  LEAVING a flight out of Denver departs within `leaving_soon_hours`
   HOME    the phone is in Denver: "Dada is home!"
   AWAY    flag + city, local time and weather there, countdown to the next flight home
 
@@ -60,6 +61,11 @@ DEFAULTS = {
     "night_brightness": 15,
     "night_start": "20:30",
     "night_end": "06:30",
+    "clock_24h": False,
+    "rotate": 0,
+    "location_every_s": 60,
+    "calendar_every_s": 300,
+    "weather_every_s": 600,
     "gpio_slowdown": 4,
     "font_dir": "/home/mk/rpi-rgb-led-matrix/fonts",
 }
@@ -608,7 +614,7 @@ def data_loop():
                 if old is None or km_between(old["lat"], old["lon"], loc["lat"], loc["lon"]) > 10:
                     due["wx"] = 0  # moved: refresh weather now
                     log("location:", loc["city"], loc["flag"], "home" if loc["at_home"] else "away")
-                due["loc"] = now + 60
+                due["loc"] = now + CFG["location_every_s"]
             except Exception as e:
                 _set_status("ha", classify_ha_error(e), error=str(e)[:120])
                 due["loc"] = now + 30
@@ -618,7 +624,7 @@ def data_loop():
                 with LOCK:
                     STATE["flights"] = fl
                     STATE["cal_error"] = ""
-                due["cal"] = now + 300
+                due["cal"] = now + CFG["calendar_every_s"]
             except Exception as e:
                 log("calendar error:", e)
                 with LOCK:
@@ -632,7 +638,7 @@ def data_loop():
                 wx = fetch_weather(lat, lon)
                 with LOCK:
                     STATE["wx"] = wx
-                due["wx"] = now + 600
+                due["wx"] = now + CFG["weather_every_s"]
             except Exception as e:
                 log("weather error:", e)
                 due["wx"] = now + 60
@@ -704,7 +710,14 @@ def next_home_flight(snap, now):
 
 
 def clock(dt):
+    """("5:30", "PM"), or ("17:30", "") with clock_24h."""
+    if CFG["clock_24h"]:
+        return dt.strftime("%H:%M"), ""
     return dt.strftime("%I:%M").lstrip("0"), dt.strftime("%p")
+
+
+def clock_width(hm, big, ap, small, gap):
+    return big.width(hm) + (gap + small.width(ap) if ap else 0)
 
 
 # ----------------------------------------------------------------------------
@@ -780,7 +793,7 @@ def draw_countdown(img, d, f, now, t):
         hm, ap = clock(arr)
         big = font("7x13B")
         tiny = font("4x6")
-        x = (W - (big.width(hm) + 2 + tiny.width(ap))) // 2
+        x = (W - clock_width(hm, big, ap, tiny, 2)) // 2
         x = text(d, x, 64, hm, big, WHITE) + 2
         text(d, x, 64, ap, tiny, GREY)
 
@@ -794,8 +807,7 @@ def screen_away(img, d, snap, now, t):
     # local time, big
     hm, ap = clock(local)
     big, tiny = font("9x18B"), font("4x6")
-    w = big.width(hm) + 1 + tiny.width(ap)
-    x = (W - w) // 2
+    x = (W - clock_width(hm, big, ap, tiny, 1)) // 2
     x = text(d, x, 27, hm, big, WHITE) + 1
     text(d, x, 20, ap, tiny, GREY)
 
@@ -872,7 +884,7 @@ def screen_flying(img, d, snap, now, t, f):
     if f["home"]:
         rainbow(d, (W - small.width("COMING HOME!")) // 2, 55, "COMING HOME!", small, t)
         hm, ap = clock(f["end"].astimezone(HOME_TZ))
-        ctext(d, 63, f"LANDS {hm} {ap}", tiny, GREY)
+        ctext(d, 63, f"LANDS {hm} {ap}".strip(), tiny, GREY)
     else:
         fit_text(img, d, 1, W - 1, 55, [("TO ", GREY), (dest_name(f), CYAN)], t, center=True)
         if f["number"]:
@@ -893,7 +905,7 @@ def screen_leaving(img, d, snap, now, t, f):
     big = font("9x15B") if font("9x15B").width(left) <= W - 2 else font("7x13B")
     ctext(d, 52, left, big, YELLOW)
     hm, ap = clock(f["start"].astimezone(HOME_TZ))
-    label = f"TAKEOFF {hm} {ap}"
+    label = f"TAKEOFF {hm} {ap}".strip()
     ctext(d, 62, label, fit_font(label, W - 2, ("4x6", "tom-thumb")), GREY)
 
 
@@ -928,7 +940,7 @@ def screen_offline(img, d, snap, now, t, reason):
     local = now.astimezone(HOME_TZ)
     hm, ap = clock(local)
     big = font("9x18B")
-    x = (W - (big.width(hm) + 1 + tiny.width(ap))) // 2
+    x = (W - clock_width(hm, big, ap, tiny, 1)) // 2
     x = text(d, x, 29, hm, big, WHITE) + 1
     text(d, x, 22, ap, tiny, GREY)
 
@@ -1066,6 +1078,8 @@ class Panel:
 
     def show(self, img, brightness):
         self.m.brightness = brightness
+        if CFG["rotate"]:
+            img = img.rotate(-CFG["rotate"])  # clockwise, for a panel mounted sideways/upside down
         self.c.SetImage(img)
         self.c = self.m.SwapOnVSync(self.c)
 
