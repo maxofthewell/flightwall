@@ -65,7 +65,11 @@ On the Pi, the app lives in `~/flightwall/` and the LED library in `~/rpi-rgb-le
 
 Screens 1–3 use the **cached calendar**, so they keep working through an HA outage. A **blinking orange 2×2 dot** in the top-right corner means a partial problem (internet down while HA is OK, a calendar error, or HA failing but still within the grace period).
 
-Other behavior: night dimming (brightness 60 → 15 from 20:30 to 06:30 Denver time); 12-hour clock (`clock_24h` switches it); `rotate` turns the whole image for sideways/upside-down mounting; poll intervals are `location_every_s` / `calendar_every_s` / `weather_every_s`; all text is uppercase ASCII (`ascii_only`).
+Other behavior: night dimming (brightness 60 → 15 from 20:30 to 06:30 Denver time; `night_brightness: 0` blanks the panel); 12-hour clock (`clock_24h` switches it); `rotate` turns the whole image for sideways/upside-down mounting; poll intervals are `location_every_s` / `calendar_every_s` / `weather_every_s`; all text is uppercase ASCII (`ascii_only`).
+
+**Home screen** also shows today's high/low (`hi` / `lo` from Open-Meteo `daily`) on the bottom row (`draw_hilo`); the clock row moves up to baseline 52 when they're there.
+
+**Settings page** (`start_web`, `SettingsHandler`): stdlib `ThreadingHTTPServer` in a daemon thread, only when `web_password` is set; port `web_port` (8080). Basic auth (any username) plus a per-process CSRF token on POSTs. `SETTINGS` lists every editable key (dotted keys go inside `home`) with a kind used for both the form and validation in `parse_settings`. `save_settings` merges into `config.json` (keeping other keys, owner, mode 600), updates `CFG` live and sets `REFRESH` so the data thread re-fetches; keys in `RESTART_KEYS` trigger `os.execv` of itself. Secrets are never rendered into the page. `LAST` holds the latest frame + snapshot for the live preview (`/panel.png`) and status table. New config keys should be added to `SETTINGS` too.
 
 ### 64×64 layout budget
 
@@ -101,7 +105,7 @@ sudo ~/rpi-rgb-led-matrix/examples-api-use/demo -D0 --led-rows=64 --led-cols=64 
 - Never let the display die: `render()` errors are caught and logged, and data-fetch failures keep the last good values.
 - Downloads (flags, airports, geocode) happen only in the data thread, never while drawing.
 - Test every visual change with `--png` and actually look at the output before shipping. Add a demo scenario for any new screen.
-- Keep `config.json` (the token) out of git. New config keys need a default in `DEFAULTS` plus an entry in `config.example.json` and the README's config table.
+- Keep `config.json` (the token) out of git. New config keys need a default in `DEFAULTS` plus an entry in `config.example.json`, the README's config table, and `SETTINGS` (the web page).
 - Maxwell is technically strong (HA, ESPHome, UniFi, Docker/Unraid, published a HACS integration), so skip the basics. He uses Flighty to track flights and runs UniFi networking.
 
 ## Open ideas, not yet requested

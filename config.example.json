@@ -25,5 +25,9 @@
   "night_end": "06:30",
   "rotate": 0,
   "gpio_slowdown": 4,
+
+  "web_password": "",
+  "web_port": 8080,
+
   "font_dir": "/home/mk/rpi-rgb-led-matrix/fonts"
 }

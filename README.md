@@ -134,8 +134,18 @@ To apply changes after editing, run `sudo systemctl restart flightwall`. To see 
 | `night_start` / `night_end` | `20:30` / `06:30` | Dimming window, Denver time |
 | `rotate` | `0` | `90` / `180` / `270`, clockwise, if the panel is mounted sideways or upside down |
 | `gpio_slowdown` | `4` | Lower (2–3) refreshes faster; raise it if you see sparkle or ghosting |
+| `web_password` | `""` | Password for the settings page. The page is off until you set this. |
+| `web_port` | `8080` | Port for the settings page |
 | `font_dir` | `/home/mk/rpi-rgb-led-matrix/fonts` | BDF fonts from the LED library |
 | `all_events_are_flights` | `false` | Treat every calendar event as a flight |
+
+## Settings page
+
+Set `web_password` in `config.json` and restart. Then open `http://<pi-ip>:8080/` (any username, that password). It shows a live preview of the panel, what the display currently knows (location, HA status, upcoming flights), and every setting in the table above.
+
+Most changes apply as soon as you press **Save**. Changing `gpio_slowdown`, the home time zone or the port restarts the display automatically. Saving rewrites `config.json`: other keys are kept, and the file keeps its owner and is set to mode 600, since it holds the HA token. The token and password are never sent to the browser; leave those boxes blank to keep them.
+
+It's plain HTTP with Basic auth, so keep it on your LAN (no port forward). Use your VPN to reach it from outside.
 
 ## Commands
 

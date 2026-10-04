@@ -16,20 +16,25 @@ Usage:
   python3 wall.py --png DIR      render the demo screens to PNG files (no panel)
 """
 import argparse
+import base64
 import csv
+import html
+import hmac
 import io
 import colorsys
 import json
 import math
 import os
 import re
+import secrets
 import socket
 import sys
 import threading
 import time
 import unicodedata
 from datetime import datetime, timedelta, timezone
-from urllib.parse import urlparse
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from urllib.parse import parse_qs, urlparse
 from zoneinfo import ZoneInfo
 
 import requests
@@ -67,6 +72,8 @@ DEFAULTS = {
     "calendar_every_s": 300,
     "weather_every_s": 600,
     "gpio_slowdown": 4,
+    "web_password": "",
+    "web_port": 8080,
     "font_dir": "/home/mk/rpi-rgb-led-matrix/fonts",
 }
 
@@ -414,9 +421,12 @@ def fetch_weather(lat, lon):
     d = requests.get("https://api.open-meteo.com/v1/forecast", timeout=15, params={
         "latitude": lat, "longitude": lon,
         "current": "temperature_2m,weather_code,is_day",
+        "daily": "temperature_2m_max,temperature_2m_min", "forecast_days": 1,
         "temperature_unit": CFG["temp_unit"], "timezone": "auto"}).json()
-    c = d["current"]
+    c, day = d["current"], d.get("daily", {})
+    hi, lo = (day.get("temperature_2m_max") or [None])[0], (day.get("temperature_2m_min") or [None])[0]
     return {"temp": round(c["temperature_2m"]), "code": c["weather_code"],
+            "hi": None if hi is None else round(hi), "lo": None if lo is None else round(lo),
             "is_day": bool(c["is_day"]), "tz": d["timezone"], "at": (lat, lon), "ts": time.time()}
 
 
@@ -562,6 +572,7 @@ STATE = {"loc": None, "wx": None, "home_wx": None, "flights": [],
          "ha": {"status": "unknown", "fail_since": None, "error": ""},
          "cal_error": ""}
 LOCK = threading.Lock()
+REFRESH = threading.Event()  # set by the settings page: re-fetch everything now
 
 
 def _set_status(key, status, **extra):
@@ -598,6 +609,9 @@ def data_loop():
     due = {"net": 0, "loc": 0, "cal": 0, "wx": 0, "hwx": 0, "apt": 0}
     while True:
         now = time.time()
+        if REFRESH.is_set():
+            REFRESH.clear()
+            due.update(net=0, loc=0, cal=0, wx=0, hwx=0)
         if now >= due["apt"]:
             due["apt"] = float("inf") if prefetch_airports() else now + 3600
         if now >= due["net"]:
@@ -841,8 +855,10 @@ def screen_home(img, d, snap, now, t):
     f = font("7x13B")
     rainbow(d, (W - f.width(msg)) // 2, 33, msg, f, t)
 
-    d.line((6, 39, W - 7, 39), fill=DIM)
+    d.line((6, 38, W - 7, 38), fill=DIM)
     wx = snap["wx"]
+    hilo = wx and wx.get("hi") is not None and wx.get("lo") is not None
+    base = 52 if hilo else 56  # clock row moves up to make room for HI / LO
     hm, _ = clock(local)
     ww = 12 + 2 + font("5x7").width(str(wx["temp"])) + 4 if wx else 0
     for name in ("7x13", "6x10", "5x7"):  # biggest clock that fits next to the weather
@@ -850,11 +866,31 @@ def screen_home(img, d, snap, now, t):
         total = f.width(hm) + (5 + ww if wx else 0)
         if total <= W - 2:
             break
-    x = text(d, (W - total) // 2, 56, hm, f, WHITE)
+    x = text(d, (W - total) // 2, base, hm, f, WHITE)
     if wx:
         x += 5
-        weather_icon(img, d, x, 45, wx["code"], wx["is_day"])
-        draw_temp(img, d, x + 14, 56, wx["temp"], font("5x7"))
+        weather_icon(img, d, x, base - 11, wx["code"], wx["is_day"])
+        draw_temp(img, d, x + 14, base, wx["temp"], font("5x7"))
+    if hilo:
+        draw_hilo(img, d, 63, wx)
+
+
+def draw_hilo(img, d, base, wx):
+    """'HI 78°  LO 52°' centred on one line: small labels, 5x7 numbers."""
+    lab, num = font("4x6"), font("5x7")
+    for deg in (True, False):  # drop the degree rings if it's too wide (e.g. -12 / -25)
+        items = [("HI", lab, ORANGE, 2), (str(wx["hi"]), num, WHITE, 6),
+                 ("LO", lab, CYAN, 2), (str(wx["lo"]), num, WHITE, 0)]
+        w = sum(f.width(t) + gap for t, f, _, gap in items) + (8 if deg else 0)
+        if w <= W - 2:
+            break
+    x = (W - w) // 2
+    for i, (t, f, c, gap) in enumerate(items):
+        x = text(d, x, base, t, f, c)
+        if i in (1, 3) and deg:
+            degree(d, x + 1, base - num.ascent, WHITE)
+            x += 4
+        x += gap
 
 
 def screen_flying(img, d, snap, now, t, f):
@@ -1003,8 +1039,8 @@ def demo_scenarios():
         return {"state": "home" if home else "not_home", "lat": 0, "lon": 0,
                 "city": city, "flag": flag, "at_home": home}
 
-    def wx(temp, code, day, tz):
-        return {"temp": temp, "code": code, "is_day": day, "tz": tz}
+    def wx(temp, code, day, tz, hi=None, lo=None):
+        return {"temp": temp, "code": code, "is_day": day, "tz": tz, "hi": hi, "lo": lo}
 
     return [
         ("away_tokyo_5days", {"loc": loc("Tokyo", "jp"), "wx": wx(71, 0, False, "Asia/Tokyo"),
@@ -1025,8 +1061,10 @@ def demo_scenarios():
                          "flights": [fl("DEN", "LHR", -2.5, 9.5, "BA 218")]}, now),
         ("landed", {"loc": loc("Denver", "us-co", True), "wx": None,
                     "flights": [fl("ORD", "DEN", -2.8, 2.6, "UA 2211")]}, now),
-        ("home", {"loc": loc("Denver", "us-co", True), "wx": wx(72, 1, True, "America/Denver"),
-                  "flights": []}, now),
+        ("home", {"loc": loc("Denver", "us-co", True),
+                  "wx": wx(72, 1, True, "America/Denver", 78, 49), "flights": []}, now),
+        ("home_cold", {"loc": loc("Denver", "us-co", True),
+                       "wx": wx(-4, 73, True, "America/Denver", 12, -11), "flights": []}, now),
         ("offline_no_ha", {"loc": None, "wx": None, "flights": [],
                            "home_wx": wx(72, 1, True, "America/Denver"),
                            "offline": ("NO HA", "CONNECTIVITY", "192.168.129.57")}, now),
@@ -1077,11 +1115,348 @@ class Panel:
         self.c = self.m.CreateFrameCanvas()
 
     def show(self, img, brightness):
+        if brightness <= 0:  # the library ignores 0, so blank the frame instead
+            img, brightness = Image.new("RGB", (W, H)), 1
         self.m.brightness = brightness
         if CFG["rotate"]:
             img = img.rotate(-CFG["rotate"])  # clockwise, for a panel mounted sideways/upside down
         self.c.SetImage(img)
         self.c = self.m.SwapOnVSync(self.c)
+
+
+# ----------------------------------------------------------------------------
+# Settings web page (http://<pi-ip>:8080, only if web_password is set)
+# ----------------------------------------------------------------------------
+LAST = {"img": None, "snap": None}  # latest frame, for the page's live preview
+
+# (key, label, kind, extra, help); dotted keys live inside "home"
+SETTINGS = [
+    ("Home Assistant", [
+        ("ha_url", "HA URL", "text", None, "e.g. http://192.168.1.3:8123"),
+        ("ha_token", "HA token", "secret", None, "long-lived access token; leave blank to keep"),
+        ("person_entity", "Person entity", "text", None, "e.g. person.maxwell"),
+        ("flight_calendar", "Flight calendar", "text", None, "e.g. calendar.flighty"),
+        ("all_events_are_flights", "Every calendar event is a flight", "bool", None, ""),
+    ]),
+    ("Screens", [
+        ("dad_name", "Name on screen", "text", None, ""),
+        ("leaving_soon_hours", '"Flies soon" starts (hours before takeoff)', "float", (0, 48), ""),
+        ("landed_minutes", '"Landed" stays up (minutes after landing)', "int", (0, 1440), ""),
+        ("lookahead_days", "Countdown looks ahead (days)", "int", (1, 365), ""),
+        ("offline_after_s", "Offline screen after (seconds of failure)", "int", (10, 3600), ""),
+        ("clock_24h", "24-hour clock", "bool", None, ""),
+        ("temp_unit", "Temperature", "choice", [("fahrenheit", "°F"), ("celsius", "°C")], ""),
+        ("airport_names", "Airport name overrides", "dict", None, "one per line, e.g. XNA=Bentonville"),
+    ]),
+    ("Home", [
+        ("home.lat", "Latitude", "float", (-90, 90), ""),
+        ("home.lon", "Longitude", "float", (-180, 180), ""),
+        ("home.radius_km", "Counts as home within (km)", "float", (0.1, 500), ""),
+        ("home.airports", "Home airports", "list", None, "comma separated, e.g. DEN"),
+        ("home.city_word", "Home city word", "text", None, 'matches "to denver" in events without codes'),
+        ("home.tz", "Time zone", "tz", None, "e.g. America/Denver"),
+    ]),
+    ("Display", [
+        ("brightness", "Brightness", "int", (1, 100), ""),
+        ("night_brightness", "Night brightness", "int", (0, 100), "0 turns the panel off at night"),
+        ("night_start", "Night starts", "time", None, "HH:MM, home time"),
+        ("night_end", "Night ends", "time", None, "HH:MM, home time"),
+        ("rotate", "Rotate", "choice", [(0, "0°"), (90, "90°"), (180, "180°"), (270, "270°")], "clockwise"),
+        ("gpio_slowdown", "GPIO slowdown", "int", (0, 5), "raise if you see sparkle/ghosting"),
+    ]),
+    ("Polling", [
+        ("location_every_s", "Location every (s)", "int", (10, 3600), ""),
+        ("calendar_every_s", "Calendar every (s)", "int", (30, 86400), ""),
+        ("weather_every_s", "Weather every (s)", "int", (60, 86400), ""),
+    ]),
+    ("This page", [
+        ("web_password", "Password", "secret", None, "leave blank to keep"),
+        ("web_port", "Port", "int", (1, 65535), ""),
+    ]),
+]
+RESTART_KEYS = {"gpio_slowdown", "home.tz", "web_port"}  # everything else applies live
+CSRF = secrets.token_urlsafe(16)
+
+
+def _cfg_get(cfg, key):
+    for part in key.split("."):
+        cfg = cfg.get(part) if isinstance(cfg, dict) else None
+    return cfg
+
+
+def _cfg_set(cfg, key, value):
+    *path, last = key.split(".")
+    for part in path:
+        cfg = cfg.setdefault(part, {})
+    cfg[last] = value
+
+
+def parse_settings(form):
+    """Form fields -> ({key: value}, [errors]). Blank secrets are left out (kept)."""
+    out, errors = {}, []
+    for _, fields in SETTINGS:
+        for key, label, kind, extra, _ in fields:
+            raw = form.get(key, [""])[0].strip()
+            try:
+                if kind == "bool":
+                    out[key] = raw == "on"
+                elif kind == "secret":
+                    if raw:
+                        out[key] = raw
+                elif kind in ("int", "float"):
+                    v = int(raw) if kind == "int" else float(raw)
+                    if extra and not extra[0] <= v <= extra[1]:
+                        raise ValueError(f"must be {extra[0]}-{extra[1]}")
+                    out[key] = v
+                elif kind == "time":
+                    if not re.fullmatch(r"([01]\d|2[0-3]):[0-5]\d", raw):
+                        raise ValueError("use HH:MM, e.g. 20:30")
+                    out[key] = raw
+                elif kind == "choice":
+                    match = [v for v, _ in extra if str(v) == raw]
+                    if not match:
+                        raise ValueError("pick one of the options")
+                    out[key] = match[0]
+                elif kind == "list":
+                    out[key] = [x.strip().upper() for x in raw.split(",") if x.strip()]
+                elif kind == "dict":
+                    table = {}
+                    for line in raw.splitlines():
+                        if line.strip():
+                            k, sep, v = line.partition("=")
+                            if not sep or not k.strip() or not v.strip():
+                                raise ValueError(f"bad line {line!r}, use CODE=City")
+                            table[k.strip().upper()] = v.strip()
+                    out[key] = table
+                elif kind == "tz":
+                    ZoneInfo(raw)
+                    out[key] = raw
+                else:
+                    if not raw and key in ("ha_url", "person_entity", "flight_calendar", "dad_name"):
+                        raise ValueError("can't be empty")
+                    out[key] = raw
+            except Exception as e:
+                errors.append(f"{label}: {e}")
+    return out, errors
+
+
+def save_settings(changes):
+    """Write the changes into config.json (keeping its other keys and owner) and into CFG.
+    Returns True if a restart is needed for them to take effect."""
+    global HOME_TZ
+    path = os.path.join(HERE, "config.json")
+    try:
+        with open(path) as fp:
+            disk = json.load(fp)
+        st = os.stat(path)
+    except FileNotFoundError:
+        disk, st = {}, None
+    restart = False
+    for key, v in changes.items():
+        if _cfg_get(CFG, key) != v:
+            restart |= key in RESTART_KEYS
+        _cfg_set(disk, key, v)
+        _cfg_set(CFG, key, v)
+    tmp = path + ".tmp"
+    with open(tmp, "w") as fp:
+        json.dump(disk, fp, indent=2)
+        fp.write("\n")
+    os.chmod(tmp, 0o600)  # it holds the HA token
+    if st:
+        try:
+            os.chown(tmp, st.st_uid, st.st_gid)  # stay editable by mk, not just root
+        except OSError:
+            pass
+    os.replace(tmp, path)
+    HOME_TZ = ZoneInfo(CFG["home"]["tz"])
+    REFRESH.set()
+    return restart
+
+
+def restart_self():
+    log("restarting (settings page)")
+    os.execv(sys.executable, [sys.executable] + sys.argv)
+
+
+def _status_rows():
+    snap, now = LAST["snap"], datetime.now(timezone.utc)
+    if not snap:
+        return [("Status", "starting up")]
+    with LOCK:
+        net, ha, cal_err = dict(STATE["net"]), dict(STATE["ha"]), STATE["cal_error"]
+    loc, wx = snap["loc"], snap["wx"]
+    rows = [("Screen now", pick_mode(snap, now)[0].upper()),
+            ("Location", f"{loc['city']} ({'home' if loc['at_home'] else 'away'})" if loc else "unknown"),
+            ("Network", f"{net['status']}, Pi is {net.get('ip') or '?'}"),
+            ("Home Assistant", ha["status"] + (f" - {ha['error']}" if ha.get("error") else "")),
+            ("Calendar", cal_err or "ok")]
+    if wx:
+        hl = f", high {wx['hi']} / low {wx['lo']}" if wx.get("hi") is not None else ""
+        rows.append(("Weather", f"{wx['temp']}°{hl}"))
+    upcoming = [f for f in snap["flights"] if f["end"] > now][:3]
+    for f in upcoming:
+        rows.append(("Flight", f"{f['start'].astimezone(HOME_TZ):%a %b %d %I:%M %p}  "
+                               f"{f['origin'] or '?'} → {f['dest'] or '?'}  {f['number']}"
+                               f"{'  (home)' if f['home'] else ''}"))
+    if not upcoming:
+        rows.append(("Flights", "none booked"))
+    return rows
+
+
+PAGE_CSS = """
+:root{color-scheme:light dark;--bg:#f4f4f6;--card:#fff;--fg:#1b1b1f;--mut:#6b6b75;--line:#ddd;--acc:#0a84ff}
+@media (prefers-color-scheme:dark){:root{--bg:#111114;--card:#1c1c21;--fg:#eee;--mut:#9a9aa5;--line:#333}}
+*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--fg);font:15px/1.4 system-ui,sans-serif}
+main{max-width:640px;margin:0 auto;padding:16px}h1{font-size:22px;margin:4px 0 12px}
+section{background:var(--card);border:1px solid var(--line);border-radius:10px;padding:12px 14px;margin:0 0 14px}
+h2{font-size:15px;margin:0 0 8px;color:var(--mut);text-transform:uppercase;letter-spacing:.04em}
+.preview{display:block;width:100%;max-width:384px;margin:0 auto;border-radius:6px;image-rendering:pixelated}
+table{width:100%;border-collapse:collapse}td{padding:3px 0;vertical-align:top}td:first-child{color:var(--mut);width:38%}
+label{display:block;margin:10px 0 2px;font-weight:600}.help{color:var(--mut);font-size:13px}
+input[type=text],input[type=password],input[type=number],select,textarea{width:100%;padding:8px;font:inherit;
+ border:1px solid var(--line);border-radius:6px;background:var(--bg);color:var(--fg)}
+textarea{min-height:70px}.check{display:flex;gap:8px;align-items:center;font-weight:600;margin:12px 0 2px}
+button{font:inherit;font-weight:600;padding:10px 16px;border:0;border-radius:8px;background:var(--acc);color:#fff}
+button.alt{background:var(--line);color:var(--fg)}.msg{padding:10px 12px;border-radius:8px;margin:0 0 14px}
+.ok{background:#1f8f4a22;border:1px solid #1f8f4a}.err{background:#d0302f22;border:1px solid #d0302f}
+.bar{display:flex;gap:10px;flex-wrap:wrap;position:sticky;bottom:0;padding:10px 0;background:var(--bg)}
+"""
+
+
+def settings_page(msg="", errors=()):
+    e = html.escape
+    out = ["<!doctype html><html><head><meta charset=utf-8>",
+           "<meta name=viewport content='width=device-width,initial-scale=1'>",
+           f"<title>FlightWall</title><style>{PAGE_CSS}</style></head><body><main>",
+           "<h1>FlightWall</h1>"]
+    if msg:
+        out.append(f"<div class='msg ok'>{e(msg)}</div>")
+    if errors:
+        out.append("<div class='msg err'>Not saved:<br>" + "<br>".join(e(x) for x in errors) + "</div>")
+    out.append("<section><h2>Live</h2><img class=preview id=pv src='panel.png' alt='panel preview'>"
+               "<table>" + "".join(f"<tr><td>{e(k)}</td><td>{e(v)}</td></tr>" for k, v in _status_rows())
+               + "</table></section>")
+    out.append(f"<form method=post action='save'><input type=hidden name=csrf value='{CSRF}'>")
+    for group, fields in SETTINGS:
+        out.append(f"<section><h2>{e(group)}</h2>")
+        for key, label, kind, extra, hlp in fields:
+            v = _cfg_get(CFG, key)
+            name = e(key)
+            if kind == "bool":
+                out.append(f"<label class=check><input type=checkbox name='{name}'"
+                           f"{' checked' if v else ''}> {e(label)}</label>")
+            else:
+                out.append(f"<label for='{name}'>{e(label)}</label>")
+                if kind == "secret":
+                    ph = "set (leave blank to keep)" if v else "not set"
+                    out.append(f"<input type=password id='{name}' name='{name}' placeholder='{ph}' "
+                               "autocomplete=new-password>")
+                elif kind == "choice":
+                    opts = "".join(f"<option value='{e(str(o))}'{' selected' if o == v else ''}>{e(t)}</option>"
+                                   for o, t in extra)
+                    out.append(f"<select id='{name}' name='{name}'>{opts}</select>")
+                elif kind == "dict":
+                    txt = "\n".join(f"{k}={c}" for k, c in (v or {}).items())
+                    out.append(f"<textarea id='{name}' name='{name}'>{e(txt)}</textarea>")
+                else:
+                    shown = ", ".join(v) if kind == "list" else ("" if v is None else str(v))
+                    typ = "number' step='any" if kind in ("int", "float") else "text"
+                    out.append(f"<input type='{typ}' id='{name}' name='{name}' value='{e(shown)}'>")
+            if hlp:
+                out.append(f"<div class=help>{e(hlp)}</div>")
+        out.append("</section>")
+    out.append("<div class=bar><button>Save</button></form>"
+               f"<form method=post action='restart'><input type=hidden name=csrf value='{CSRF}'>"
+               "<button class=alt>Restart display</button></form></div>")
+    out.append("<script>setInterval(()=>{document.getElementById('pv').src='panel.png?'+Date.now()},2000)"
+               "</script></main></body></html>")
+    return "".join(out)
+
+
+class SettingsHandler(BaseHTTPRequestHandler):
+    def log_message(self, *a):
+        pass
+
+    def _authed(self):
+        hdr = self.headers.get("Authorization", "")
+        if hdr.startswith("Basic "):
+            try:
+                _, _, pw = base64.b64decode(hdr[6:]).decode().partition(":")
+            except Exception:
+                pw = ""
+            if hmac.compare_digest(pw.encode(), str(CFG["web_password"]).encode()):
+                return True
+            time.sleep(1)  # slow down guessing
+        self.send_response(401)
+        self.send_header("WWW-Authenticate", 'Basic realm="FlightWall"')
+        self.end_headers()
+        return False
+
+    def _send(self, body, ctype="text/html; charset=utf-8", code=200):
+        if isinstance(body, str):
+            body = body.encode()
+        self.send_response(code)
+        self.send_header("Content-Type", ctype)
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+        self.wfile.write(body)
+
+    def do_GET(self):
+        if not self._authed():
+            return
+        path = urlparse(self.path).path
+        if path == "/panel.png":
+            img = LAST["img"] or Image.new("RGB", (W, H))
+            buf = io.BytesIO()
+            led_preview(img, 6).save(buf, "PNG")
+            return self._send(buf.getvalue(), "image/png")
+        if path == "/":
+            return self._send(settings_page())
+        self._send("not found", "text/plain", 404)
+
+    def do_POST(self):
+        if not self._authed():
+            return
+        n = min(int(self.headers.get("Content-Length") or 0), 100_000)
+        form = parse_qs(self.rfile.read(n).decode(), keep_blank_values=True)
+        if not hmac.compare_digest(form.get("csrf", [""])[0], CSRF):
+            return self._send("Stale page - reload and try again.", "text/plain", 403)
+        path = urlparse(self.path).path
+        if path == "/restart":
+            self._send(settings_page("Restarting... reload this page in about 10 seconds."))
+            threading.Timer(1, restart_self).start()
+        elif path == "/save":
+            changes, errors = parse_settings(form)
+            if errors:
+                return self._send(settings_page(errors=errors))
+            try:
+                restart = save_settings(changes)
+            except Exception as e:
+                return self._send(settings_page(errors=[f"couldn't write config.json: {e}"]))
+            log("settings saved from the web page")
+            if restart:
+                self._send(settings_page("Saved. Restarting to apply... reload in about 10 seconds."))
+                threading.Timer(1, restart_self).start()
+            else:
+                self._send(settings_page("Saved and applied."))
+        else:
+            self._send("not found", "text/plain", 404)
+
+
+def start_web():
+    if not CFG["web_password"]:
+        log("settings page off (set web_password in config.json to turn it on)")
+        return
+    try:
+        srv = ThreadingHTTPServer(("", int(CFG["web_port"])), SettingsHandler)
+    except OSError as e:
+        log("settings page couldn't start:", e)
+        return
+    srv.daemon_threads = True
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    _, ip = check_network()
+    log(f"settings page on http://{ip or '<pi-ip>'}:{CFG['web_port']}/")
 
 
 # ----------------------------------------------------------------------------
@@ -1191,7 +1566,7 @@ def diagnose():
         bad(f"location lookup failed: {str(e)[:100]}")
     try:
         w = fetch_weather(*((loc["lat"], loc["lon"]) if loc else (CFG["home"]["lat"], CFG["home"]["lon"])))
-        ok(f"weather: {w['temp']} deg, code {w['code']}, timezone {w['tz']}")
+        ok(f"weather: {w['temp']} deg (hi {w['hi']} / lo {w['lo']}), code {w['code']}, timezone {w['tz']}")
     except Exception as e:
         bad(f"weather failed: {str(e)[:100]}")
 
@@ -1233,6 +1608,7 @@ def main():
             time.sleep(0.1)
 
     threading.Thread(target=data_loop, daemon=True).start()
+    start_web()
     while True:
         now = datetime.now(timezone.utc)
         with LOCK:
@@ -1246,6 +1622,7 @@ def main():
         except Exception as e:  # never let a drawing bug kill the display
             log("render error:", e)
             img = Image.new("RGB", (W, H))
+        LAST["img"], LAST["snap"] = img, snap
         panel.show(img, brightness_for(now))
         time.sleep(0.1)
 
