@@ -67,7 +67,7 @@ Screens 1–3 use the **cached calendar**, so they keep working through an HA ou
 
 Other behavior: night dimming (brightness 60 → 15 from 20:30 to 06:30 Denver time; `night_brightness: 0` blanks the panel); 12-hour clock (`clock_24h` switches it); `rotate` turns the whole image for sideways/upside-down mounting; poll intervals are `location_every_s` / `calendar_every_s` / `weather_every_s`; all text is uppercase ASCII (`ascii_only`).
 
-**Home screen** also shows today's high/low (`hi` / `lo` from Open-Meteo `daily`) on the bottom row (`draw_hilo`); the clock row moves up to baseline 52 when they're there.
+**Home screen** also shows today's high/low (`hi` / `lo` from Open-Meteo `daily`) on the bottom row (`draw_hilo`); the clock row moves up to baseline 46 when they're there. The whole home screen sits high (DADA baseline 15, IS HOME! 29, divider 33, HI/LO baseline 56) so rows 56–63 stay empty for the frame edge.
 
 **Settings page** (`start_web`, `SettingsHandler`): stdlib `ThreadingHTTPServer` in a daemon thread, only when `web_password` is set; port `web_port` (8080). Basic auth (any username) plus a per-process CSRF token on POSTs. `SETTINGS` lists every editable key (dotted keys go inside `home`) with a kind used for both the form and validation in `parse_settings`. `save_settings` merges into `config.json` (keeping other keys, owner, mode 600), updates `CFG` live and sets `REFRESH` so the data thread re-fetches; keys in `RESTART_KEYS` trigger `os.execv` of itself. Secrets are never rendered into the page. `LAST` holds the latest frame + snapshot for the live preview (`/panel.png`) and status table. New config keys should be added to `SETTINGS` too.
 

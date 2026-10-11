@@ -845,20 +845,21 @@ def screen_home(img, d, snap, now, t):
     local = now.astimezone(HOME_TZ)
     big = font("9x18B")
     name = CFG["dad_name"]
-    x = ctext(d, 17, name, big, WHITE)
+    x = ctext(d, 15, name, big, WHITE)
     pulse = 0.55 + 0.45 * (0.5 + 0.5 * math.sin(t * 4))
     col = tuple(int(c * pulse) for c in PINK)
     xl = (W - big.width(name)) // 2
-    sprite(img, xl - 10, 7, HEART, {"X": col})
-    sprite(img, x + 3, 7, HEART, {"X": col})
+    sprite(img, xl - 10, 5, HEART, {"X": col})
+    sprite(img, x + 3, 5, HEART, {"X": col})
     msg = "IS HOME!"
     f = font("7x13B")
-    rainbow(d, (W - f.width(msg)) // 2, 33, msg, f, t)
+    rainbow(d, (W - f.width(msg)) // 2, 29, msg, f, t)
 
-    d.line((6, 38, W - 7, 38), fill=DIM)
+    # everything sits a little high so the bottom rows stay empty (frame edge)
+    d.line((6, 33, W - 7, 33), fill=DIM)
     wx = snap["wx"]
     hilo = wx and wx.get("hi") is not None and wx.get("lo") is not None
-    base = 52 if hilo else 56  # clock row moves up to make room for HI / LO
+    base = 46 if hilo else 50  # clock row moves up to make room for HI / LO
     hm, _ = clock(local)
     ww = 12 + 2 + font("5x7").width(str(wx["temp"])) + 4 if wx else 0
     for name in ("7x13", "6x10", "5x7"):  # biggest clock that fits next to the weather
@@ -872,7 +873,7 @@ def screen_home(img, d, snap, now, t):
         weather_icon(img, d, x, base - 11, wx["code"], wx["is_day"])
         draw_temp(img, d, x + 14, base, wx["temp"], font("5x7"))
     if hilo:
-        draw_hilo(img, d, 63, wx)
+        draw_hilo(img, d, 56, wx)
 
 
 def draw_hilo(img, d, base, wx):
