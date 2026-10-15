@@ -147,6 +147,10 @@ Most changes apply as soon as you press **Save**. Changing `gpio_slowdown`, the 
 
 It's plain HTTP with Basic auth, so keep it on your LAN (no port forward). Use your VPN to reach it from outside.
 
+## Where Dada is
+
+The phone's GPS (via the HA person entity) decides, with one exception: if a flight in the calendar has **landed since the phone last reported**, the display assumes he's at that flight's destination (its city, flag, time zone and weather). As soon as the phone reports again, GPS takes over. This covers the common case of the HA app not updating for hours after a flight. The calendar is read 30 days back for this.
+
 ## Commands
 
 | Command | What it does |

@@ -431,6 +431,7 @@ def fetch_weather(lat, lon):
 
 
 # ---- flights from the calendar ------------------------------------------------
+LOOKBACK_DAYS = 30  # how far back to read flights: the last landing says where he is
 ROUTE = re.compile(r"\b([A-Z]{3})\s*(?:→|->|>|–|—|\bto\b)\s*([A-Z]{3})\b")
 FLTNUM = re.compile(r"\b([A-Z]{2}|[A-Z]\d|\d[A-Z])\s?(\d{1,4})\b")
 
@@ -469,7 +470,7 @@ def fetch_flights():
     now = datetime.now(timezone.utc)
     fmt = "%Y-%m-%dT%H:%M:%SZ"
     events = ha_get(f"/api/calendars/{CFG['flight_calendar']}", {
-        "start": (now - timedelta(days=2)).strftime(fmt),
+        "start": (now - timedelta(days=LOOKBACK_DAYS)).strftime(fmt),
         "end": (now + timedelta(days=CFG["lookahead_days"])).strftime(fmt)})
     flights = [f for f in (parse_flight(e) for e in events) if f]
     return sorted(flights, key=lambda f: f["start"])
@@ -523,11 +524,11 @@ _airports = None
 
 
 def _airports_path():
-    return os.path.join(CACHE, "airports.json")
+    return os.path.join(CACHE, "airports2.json")  # {IATA: [city, lat, lon, flag]}
 
 
 def prefetch_airports():
-    """Build {IATA: city} from OurAirports once; a few MB, cached forever."""
+    """Build {IATA: [city, lat, lon, flag]} from OurAirports once; a few MB, cached forever."""
     if os.path.exists(_airports_path()):
         return True
     try:
@@ -541,7 +542,14 @@ def prefetch_airports():
                 continue
             big = row.get("type") in ("large_airport", "medium_airport")
             if code not in table or big:
-                table[code] = city.split(",")[-1].strip()  # "Ota, Tokyo" -> "Tokyo"
+                cc = (row.get("iso_country") or "").lower()
+                region = (row.get("iso_region") or "").lower()
+                flag = region if cc == "us" and region.startswith("us-") else cc
+                try:
+                    lat, lon = float(row["latitude_deg"]), float(row["longitude_deg"])
+                except (KeyError, ValueError):
+                    lat = lon = None
+                table[code] = [city.split(",")[-1].strip(), lat, lon, flag]  # "Ota, Tokyo" -> "Tokyo"
         os.makedirs(CACHE, exist_ok=True)
         with open(_airports_path(), "w") as fp:
             json.dump(table, fp)
@@ -552,22 +560,30 @@ def prefetch_airports():
         return False
 
 
-def airport_city(code):
+def airport_info(code):
+    """{"city", "lat", "lon", "flag"} for an IATA code, or None if unknown."""
     global _airports
     if not code:
         return None
-    if code in CFG["airport_names"]:
-        return CFG["airport_names"][code]
-    if code in AIRPORT_FIXES:
-        return AIRPORT_FIXES[code]
     if _airports is None and os.path.exists(_airports_path()):
         with open(_airports_path()) as fp:
             _airports = json.load(fp)
-    return (_airports or {}).get(code)
+    row = (_airports or {}).get(code)
+    info = dict(zip(("city", "lat", "lon", "flag"), row)) if row else {}
+    city = CFG["airport_names"].get(code) or AIRPORT_FIXES.get(code) or info.get("city")
+    if not city and not info:
+        return None
+    info["city"] = city
+    return info
+
+
+def airport_city(code):
+    info = airport_info(code)
+    return info["city"] if info else None
 
 
 # ---- background updater ------------------------------------------------------
-STATE = {"loc": None, "wx": None, "home_wx": None, "flights": [],
+STATE = {"gps": None, "loc": None, "wx": None, "home_wx": None, "flights": [],
          "net": {"status": "unknown", "ip": None, "fail_since": None},
          "ha": {"status": "unknown", "fail_since": None, "error": ""},
          "cal_error": ""}
@@ -588,7 +604,15 @@ def _set_status(key, status, **extra):
         cur.update(extra)
 
 
+def _iso(v):
+    try:
+        return datetime.fromisoformat(v.replace("Z", "+00:00"))
+    except (AttributeError, ValueError):
+        return None
+
+
 def update_location():
+    """Where the phone says he is (GPS), with "fix" = when it last reported."""
     st = ha_get(f"/api/states/{CFG['person_entity']}")
     a = st.get("attributes", {})
     lat, lon = a.get("latitude"), a.get("longitude")
@@ -601,8 +625,39 @@ def update_location():
         near = km_between(lat, lon, hm["lat"], hm["lon"]) <= hm["radius_km"]
         loc = {"state": st["state"], "lat": lat, "lon": lon, "city": city, "flag": flag,
                "at_home": near or st["state"] == "home"}
+    times = [t for t in (_iso(st.get("last_reported")), _iso(st.get("last_updated"))) if t]
+    loc["fix"] = max(times) if times else None
     prefetch_flag(loc["flag"])
     return loc
+
+
+def trip_location(gps, flights, now):
+    """Where he is: the GPS position, unless he has landed somewhere since it last reported.
+
+    The phone often doesn't report for hours (app asleep, no VPN, airplane mode), so the
+    destination of the most recent landed flight wins over an older GPS fix."""
+    if not gps:
+        return gps
+    landed = [f for f in flights if f["end"] <= now and (f["dest"] or f["home"])]
+    if not landed:
+        return gps
+    last = max(landed, key=lambda f: f["end"])
+    if gps.get("fix") and gps["fix"] >= last["end"]:
+        return gps  # the phone has reported since landing: trust it
+    via = f"{last['origin'] or '?'}->{last['dest'] or '?'}"
+    if last["home"]:
+        if gps["at_home"]:
+            return gps
+        hm = CFG["home"]
+        return dict(gps, lat=hm["lat"], lon=hm["lon"], city=airport_city(last["dest"]) or "HOME",
+                    flag=(airport_info(last["dest"]) or {}).get("flag"), at_home=True, via=via)
+    info = airport_info(last["dest"])
+    if not info or info.get("lat") is None:
+        return gps  # don't know where that airport is
+    if not gps["at_home"] and km_between(gps["lat"], gps["lon"], info["lat"], info["lon"]) < 100:
+        return gps  # GPS already puts him there, and names the city better
+    return dict(gps, lat=info["lat"], lon=info["lon"], city=info["city"], flag=info["flag"],
+                at_home=False, via=via)
 
 
 def data_loop():
@@ -620,14 +675,10 @@ def data_loop():
             due["net"] = now + 30
         if now >= due["loc"]:
             try:
-                loc = update_location()
+                gps = update_location()
                 _set_status("ha", "ok", error="")
                 with LOCK:
-                    old = STATE["loc"]
-                    STATE["loc"] = loc
-                if old is None or km_between(old["lat"], old["lon"], loc["lat"], loc["lon"]) > 10:
-                    due["wx"] = 0  # moved: refresh weather now
-                    log("location:", loc["city"], loc["flag"], "home" if loc["at_home"] else "away")
+                    STATE["gps"] = gps
                 due["loc"] = now + CFG["location_every_s"]
             except Exception as e:
                 _set_status("ha", classify_ha_error(e), error=str(e)[:120])
@@ -644,6 +695,18 @@ def data_loop():
                 with LOCK:
                     STATE["cal_error"] = str(e)[:120]
                 due["cal"] = now + 60
+        with LOCK:  # GPS + calendar -> where he is (cheap, so every pass)
+            gps, fl, old = STATE["gps"], STATE["flights"], STATE["loc"]
+        loc = trip_location(gps, fl, datetime.now(timezone.utc))
+        if loc is not old:
+            with LOCK:
+                STATE["loc"] = loc
+            if loc and (old is None or loc.get("via") != old.get("via") or loc["at_home"] != old["at_home"]
+                        or km_between(old["lat"], old["lon"], loc["lat"], loc["lon"]) > 10):
+                due["wx"] = 0  # moved: refresh weather now
+                prefetch_flag(loc["flag"])
+                log("location:", loc["city"], loc["flag"], "home" if loc["at_home"] else "away",
+                    f"(from flight {loc['via']}, GPS is older)" if loc.get("via") else "")
         if now >= due["wx"]:
             with LOCK:
                 loc = STATE["loc"]
@@ -1036,9 +1099,12 @@ def demo_scenarios():
         return {"start": s, "end": s + timedelta(hours=dur_h), "origin": o, "dest": de,
                 "number": num, "home": de in CFG["home"]["airports"], "summary": ""}
 
-    def loc(city, flag, home=False):
-        return {"state": "home" if home else "not_home", "lat": 0, "lon": 0,
-                "city": city, "flag": flag, "at_home": home}
+    def loc(city, flag, home=False, fix_h=0.0, lat=0, lon=0):
+        return {"state": "home" if home else "not_home", "lat": lat, "lon": lon,
+                "city": city, "flag": flag, "at_home": home, "fix": now + timedelta(hours=fix_h)}
+
+    def stale(gps, flights, wx_):  # phone hasn't reported since landing: the calendar decides
+        return {"loc": trip_location(gps, flights, now), "wx": wx_, "flights": flights}
 
     def wx(temp, code, day, tz, hi=None, lo=None):
         return {"temp": temp, "code": code, "is_day": day, "tz": tz, "hi": hi, "lo": lo}
@@ -1082,6 +1148,12 @@ def demo_scenarios():
                                 "flights": [fl("DEN", "SFO", 0.66, 2.4, "UA 552")]}, now),
         ("flying_elsewhere", {"loc": loc("London", "gb"), "wx": None,
                               "flights": [fl("LHR", "CDG", -0.4, 1.3, "AF 1681")]}, now),
+        ("stale_gps_flew_away", stale(loc("Denver", "us-co", True, -20, 39.74, -104.99),
+                                      [fl("DEN", "HND", -15, 11, "UA 131")],
+                                      wx(64, 2, False, "Asia/Tokyo")), now),
+        ("stale_gps_flew_home", stale(loc("Chicago", "us-il", False, -6, 41.88, -87.63),
+                                      [fl("ORD", "DEN", -5, 2.6, "UA 2211")],
+                                      wx(72, 1, True, "America/Denver", 78, 49)), now),
         ("flying_long_name", {"loc": loc("Chicago", "us-il"), "wx": None,
                               "flights": [fl("ORD", "SLC", -1.0, 3.2, "DL 1402")]}, now),
     ]
@@ -1279,6 +1351,17 @@ def restart_self():
     os.execv(sys.executable, [sys.executable] + sys.argv)
 
 
+def _loc_text(loc):
+    if not loc:
+        return "unknown"
+    s = f"{loc['city']} ({'home' if loc['at_home'] else 'away'})"
+    if loc.get("via"):
+        s += f", from flight {loc['via']}; GPS hasn't reported since landing"
+    if loc.get("fix"):
+        s += f"; GPS last reported {loc['fix'].astimezone(HOME_TZ):%a %I:%M %p}"
+    return s
+
+
 def _status_rows():
     snap, now = LAST["snap"], datetime.now(timezone.utc)
     if not snap:
@@ -1287,7 +1370,7 @@ def _status_rows():
         net, ha, cal_err = dict(STATE["net"]), dict(STATE["ha"]), STATE["cal_error"]
     loc, wx = snap["loc"], snap["wx"]
     rows = [("Screen now", pick_mode(snap, now)[0].upper()),
-            ("Location", f"{loc['city']} ({'home' if loc['at_home'] else 'away'})" if loc else "unknown"),
+            ("Location", _loc_text(loc)),
             ("Network", f"{net['status']}, Pi is {net.get('ip') or '?'}"),
             ("Home Assistant", ha["status"] + (f" - {ha['error']}" if ha.get("error") else "")),
             ("Calendar", cal_err or "ok")]
@@ -1561,8 +1644,14 @@ def diagnose():
     print("\nINTERNET SERVICES")
     try:
         loc = update_location()
-        ok(f"location: {loc['city']} (flag {loc['flag']}), "
-           f"{'HOME' if loc['at_home'] else 'away'}")
+        fix = f"{loc['fix'].astimezone(HOME_TZ):%a %b %d %I:%M %p}" if loc.get("fix") else "?"
+        ok(f"GPS location: {loc['city']} (flag {loc['flag']}), "
+           f"{'HOME' if loc['at_home'] else 'away'}, last reported {fix}")
+        trip = trip_location(loc, fl, datetime.now(timezone.utc))
+        if trip is not loc:
+            ok(f"but flight {trip['via']} landed after that, so showing: {trip['city']} "
+               f"({'HOME' if trip['at_home'] else 'away'})")
+            loc = trip
     except Exception as e:
         bad(f"location lookup failed: {str(e)[:100]}")
     try:
