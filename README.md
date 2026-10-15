@@ -14,7 +14,7 @@ The screen is picked automatically, in this order:
 |---|---|---|
 | **Flying** | A flight from the calendar is in progress | "DADA IS FLYING", route (ORD → DEN), progress bar with a moving plane, time left. Flights home add "COMING HOME!" and the landing time; others show "TO LONDON" and the flight number. |
 | **Landed** | A flight into Denver landed less than 90 min ago | "DADA LANDED! 12 MIN AGO" |
-| **Flies soon** | A flight out of Denver takes off within 4 hours | Route, "TO LONDON", countdown ("2H 45M", then "40 MIN") and takeoff time |
+| **Flies soon** | Any booked flight takes off within 4 hours, from any airport, even if his phone says he's home | Route, "TO LONDON" (or "COMING HOME!"), countdown ("2H 45M", then "40 MIN") and takeoff time |
 | **Offline** | Home Assistant or the network has been unreachable for 90 s | Denver time, weather and date, plus what's wrong (see [Troubleshooting](#troubleshooting)) |
 | **Home** | Phone is within 40 km of Denver | "DADA IS HOME!" with Denver time and weather |
 | **Away** | Anywhere else | State flag (US) or country flag, city name, local time, weather, and a countdown to the next flight home: "6 DAYS TIL DADA!", then "HOME TOMORROW" / "HOME TODAY!" with the arrival time |
@@ -122,7 +122,7 @@ To apply changes after editing, run `sudo systemctl restart flightwall`. To see 
 | `flight_calendar` | `calendar.flighty` | Calendar with the flights |
 | `home` | Denver | `lat`, `lon`, `radius_km` (counts as home), `airports` (flights to these are "home"), `tz` |
 | `dad_name` | `DADA` | Name shown on screen |
-| `leaving_soon_hours` | `4` | Hours before a flight out of Denver that the "flies soon" screen starts (decimals OK, e.g. `2.5`) |
+| `leaving_soon_hours` | `4` | Hours before any booked flight that the "flies soon" screen starts (decimals OK, e.g. `2.5`; up to 168) |
 | `landed_minutes` | `90` | Minutes after landing in Denver that the "landed" screen stays up |
 | `lookahead_days` | `90` | How far ahead to read the calendar; a flight home further out than this shows the date instead of a countdown |
 | `offline_after_s` | `90` | Seconds of failure before the offline screen appears |
@@ -146,10 +146,6 @@ Set `web_password` in `config.json` and restart. Then open `http://<pi-ip>:8080/
 Most changes apply as soon as you press **Save**. Changing `gpio_slowdown`, the home time zone or the port restarts the display automatically. Saving rewrites `config.json`: other keys are kept, and the file keeps its owner and is set to mode 600, since it holds the HA token. The token and password are never sent to the browser; leave those boxes blank to keep them.
 
 It's plain HTTP with Basic auth, so keep it on your LAN (no port forward). Use your VPN to reach it from outside.
-
-## Where Dada is
-
-The phone's GPS (via the HA person entity) decides, with one exception: if a flight in the calendar has **landed since the phone last reported**, the display assumes he's at that flight's destination (its city, flag, time zone and weather). As soon as the phone reports again, GPS takes over. Likewise, if the phone hasn't reported for 6 hours and a flight departs within 3 days, he's assumed to be at that flight's departure airport (e.g. Chicago before flying home from MDW). This covers the common case of the HA app not updating for hours after a flight. The calendar is read 30 days back for this.
 
 ## Commands
 
