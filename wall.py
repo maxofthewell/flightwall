@@ -1632,7 +1632,7 @@ def diagnose():
     prefetch_airports()
     try:
         fl = fetch_flights()
-        ok(f"{len(fl)} flight(s) found in the next {CFG['lookahead_days']} days:")
+        ok(f"{len(fl)} flight(s) found ({LOOKBACK_DAYS} days back to {CFG['lookahead_days']} ahead):")
         for f in fl:
             print(f"      {f['start'].astimezone(HOME_TZ):%a %b %d %I:%M%p} -> "
                   f"{f['end'].astimezone(HOME_TZ):%I:%M%p}  {f['origin']}->{f['dest']} "

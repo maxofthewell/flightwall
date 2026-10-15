@@ -25,6 +25,13 @@ It is **not** part of Maxwell's separate ADS-B receiver project (Pi 5 with two d
 - Not yet confirmed: whether the system setup block (audio off, snd_bcm2835 blacklist, `isolcpus=3`, library build and pip install) and the systemd service were completed. Verify on the Pi before debugging anything else.
 - Not yet confirmed: the real `person_entity`, the `flight_calendar` entity ID, and that Flighty Calendar Export → Google/iCloud calendar → HA integration is set up. `--check` lists the actual person and calendar entities if the configured ones are wrong.
 
+## Verified on Oct 15 (first `--check` against real HA)
+
+- The Pi (now `192.168.2.134`) reaches HA at `192.168.1.3:8123`; the token works. The old UTR blocker is gone.
+- Real entities: `person.maxwell` (has GPS) and **`calendar.maxwell_flights`** (not `calendar.flighty`).
+- Real Flighty event summary format: `✈ MDW→DEN • WN 383`. `parse_flight` handles it: route, flight number, `home` flag and city names all came out right.
+- Seen: person state `not_home` while GPS was within 40 km of Denver, so the display (radius rule) said HOME. That's expected (HA's home zone is smaller).
+
 ## Repo layout
 
 ```
