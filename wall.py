@@ -625,8 +625,18 @@ def update_location():
         near = km_between(lat, lon, hm["lat"], hm["lon"]) <= hm["radius_km"]
         loc = {"state": st["state"], "lat": lat, "lon": lon, "city": city, "flag": flag,
                "at_home": near or st["state"] == "home"}
-    times = [t for t in (_iso(st.get("last_reported")), _iso(st.get("last_updated"))) if t]
+    # When did the phone last send a position? Not the person's own timestamps: HA rewrites the
+    # person whenever any of its trackers changes, even if the coordinates are days old. Use the
+    # tracker the position came from ("source", e.g. device_tracker.iphone) instead.
+    src, stamped = a.get("source"), st
+    if src:
+        try:
+            stamped = ha_get(f"/api/states/{src}")
+        except Exception:
+            src = None
+    times = [t for t in (_iso(stamped.get("last_reported")), _iso(stamped.get("last_updated"))) if t]
     loc["fix"] = max(times) if times else None
+    loc["fix_src"] = src or CFG["person_entity"]
     prefetch_flag(loc["flag"])
     return loc
 
@@ -1667,7 +1677,7 @@ def diagnose():
         loc = update_location()
         fix = f"{loc['fix'].astimezone(HOME_TZ):%a %b %d %I:%M %p}" if loc.get("fix") else "?"
         ok(f"GPS location: {loc['city']} (flag {loc['flag']}), "
-           f"{'HOME' if loc['at_home'] else 'away'}, last reported {fix}")
+           f"{'HOME' if loc['at_home'] else 'away'}, last reported {fix} (by {loc['fix_src']})")
         trip = trip_location(loc, fl, datetime.now(timezone.utc))
         if trip is not loc:
             ok(f"but the calendar ({trip['via']}) is newer, so showing: {trip['city']} "
