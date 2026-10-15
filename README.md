@@ -149,7 +149,7 @@ It's plain HTTP with Basic auth, so keep it on your LAN (no port forward). Use y
 
 ## Where Dada is
 
-The phone's GPS (via the HA person entity) decides, with one exception: if a flight in the calendar has **landed since the phone last reported**, the display assumes he's at that flight's destination (its city, flag, time zone and weather). As soon as the phone reports again, GPS takes over. This covers the common case of the HA app not updating for hours after a flight. The calendar is read 30 days back for this.
+The phone's GPS (via the HA person entity) decides, with one exception: if a flight in the calendar has **landed since the phone last reported**, the display assumes he's at that flight's destination (its city, flag, time zone and weather). As soon as the phone reports again, GPS takes over. Likewise, if the phone hasn't reported for 6 hours and a flight departs within 3 days, he's assumed to be at that flight's departure airport (e.g. Chicago before flying home from MDW). This covers the common case of the HA app not updating for hours after a flight. The calendar is read 30 days back for this.
 
 ## Commands
 

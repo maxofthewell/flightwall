@@ -631,33 +631,51 @@ def update_location():
     return loc
 
 
-def trip_location(gps, flights, now):
-    """Where he is: the GPS position, unless he has landed somewhere since it last reported.
+GPS_STALE_HOURS = 6     # a GPS fix older than this can be overruled by the next flight's origin
+NEXT_FLIGHT_DAYS = 3    # ...if that flight leaves within this many days
 
-    The phone often doesn't report for hours (app asleep, no VPN, airplane mode), so the
-    destination of the most recent landed flight wins over an older GPS fix."""
-    if not gps:
-        return gps
-    landed = [f for f in flights if f["end"] <= now and (f["dest"] or f["home"])]
-    if not landed:
-        return gps
-    last = max(landed, key=lambda f: f["end"])
-    if gps.get("fix") and gps["fix"] >= last["end"]:
-        return gps  # the phone has reported since landing: trust it
-    via = f"{last['origin'] or '?'}->{last['dest'] or '?'}"
-    if last["home"]:
+
+def _at_airport(gps, code, home, via):
+    """gps moved to an airport (home airports -> home), or gps itself if that's no better."""
+    if home:
         if gps["at_home"]:
             return gps
         hm = CFG["home"]
-        return dict(gps, lat=hm["lat"], lon=hm["lon"], city=airport_city(last["dest"]) or "HOME",
-                    flag=(airport_info(last["dest"]) or {}).get("flag"), at_home=True, via=via)
-    info = airport_info(last["dest"])
+        return dict(gps, lat=hm["lat"], lon=hm["lon"], city=airport_city(code) or "HOME",
+                    flag=(airport_info(code) or {}).get("flag"), at_home=True, via=via)
+    info = airport_info(code)
     if not info or info.get("lat") is None:
         return gps  # don't know where that airport is
     if not gps["at_home"] and km_between(gps["lat"], gps["lon"], info["lat"], info["lon"]) < 100:
         return gps  # GPS already puts him there, and names the city better
     return dict(gps, lat=info["lat"], lon=info["lon"], city=info["city"], flag=info["flag"],
                 at_home=False, via=via)
+
+
+def trip_location(gps, flights, now):
+    """Where he is: the GPS position, unless the calendar knows better.
+
+    The phone often doesn't report for hours (app asleep, no VPN, airplane mode), so:
+    1. if a flight landed after the last GPS fix, he's at its destination;
+    2. else if the fix is stale and his next flight leaves soon from somewhere else,
+       he's at that flight's origin (e.g. GPS stuck at DEN, flying home from MDW today)."""
+    if not gps:
+        return gps
+    fix, airports = gps.get("fix"), CFG["home"]["airports"]
+    landed = [f for f in flights if f["end"] <= now and (f["dest"] or f["home"])]
+    last = max(landed, key=lambda f: f["end"]) if landed else None
+    if last and not (fix and fix >= last["end"]):
+        return _at_airport(gps, last["dest"], last["home"],
+                           f"{last['origin'] or '?'}->{last['dest'] or '?'}")
+    if fix and now - fix < timedelta(hours=GPS_STALE_HOURS):
+        return gps  # recent enough to trust
+    upcoming = [f for f in flights if now < f["start"] <= now + timedelta(days=NEXT_FLIGHT_DAYS)
+                and f["origin"]]
+    if upcoming:
+        nxt = min(upcoming, key=lambda f: f["start"])
+        return _at_airport(gps, nxt["origin"], nxt["origin"] in airports,
+                           f"next flight {nxt['origin']}->{nxt['dest'] or '?'}")
+    return gps
 
 
 def data_loop():
@@ -706,7 +724,7 @@ def data_loop():
                 due["wx"] = 0  # moved: refresh weather now
                 prefetch_flag(loc["flag"])
                 log("location:", loc["city"], loc["flag"], "home" if loc["at_home"] else "away",
-                    f"(from flight {loc['via']}, GPS is older)" if loc.get("via") else "")
+                    f"(from calendar: {loc['via']}; GPS is older)" if loc.get("via") else "")
         if now >= due["wx"]:
             with LOCK:
                 loc = STATE["loc"]
@@ -1154,6 +1172,9 @@ def demo_scenarios():
         ("stale_gps_flew_home", stale(loc("Chicago", "us-il", False, -6, 41.88, -87.63),
                                       [fl("ORD", "DEN", -5, 2.6, "UA 2211")],
                                       wx(72, 1, True, "America/Denver", 78, 49)), now),
+        ("stale_gps_flying_home_today", stale(loc("Denver", "us-co", True, -96, 39.86, -104.67),
+                                              [fl("MDW", "DEN", 2, 2.7, "WN 383")],
+                                              wx(55, 3, True, "America/Chicago")), now),
         ("flying_long_name", {"loc": loc("Chicago", "us-il"), "wx": None,
                               "flights": [fl("ORD", "SLC", -1.0, 3.2, "DL 1402")]}, now),
     ]
@@ -1356,7 +1377,7 @@ def _loc_text(loc):
         return "unknown"
     s = f"{loc['city']} ({'home' if loc['at_home'] else 'away'})"
     if loc.get("via"):
-        s += f", from flight {loc['via']}; GPS hasn't reported since landing"
+        s += f", from calendar ({loc['via']}) because GPS is older"
     if loc.get("fix"):
         s += f"; GPS last reported {loc['fix'].astimezone(HOME_TZ):%a %I:%M %p}"
     return s
@@ -1649,7 +1670,7 @@ def diagnose():
            f"{'HOME' if loc['at_home'] else 'away'}, last reported {fix}")
         trip = trip_location(loc, fl, datetime.now(timezone.utc))
         if trip is not loc:
-            ok(f"but flight {trip['via']} landed after that, so showing: {trip['city']} "
+            ok(f"but the calendar ({trip['via']}) is newer, so showing: {trip['city']} "
                f"({'HOME' if trip['at_home'] else 'away'})")
             loc = trip
     except Exception as e:
