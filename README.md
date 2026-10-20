@@ -152,7 +152,7 @@ It's plain HTTP with Basic auth, so keep it on your LAN (no port forward). Use y
 
 For Grandma's trip, say. In the settings page's **Visitor** section, tick **Show a visitor** and fill in their name, where they are (or leave it blank to use the departure airport's city), the flight number, the from/to airports, and departure and landing times (home time). Then:
 
-1. **Until their flight**, the screen shows them instead of the home/away screen: flag, "GRAMMY IS IN CHICAGO", local time and weather, and a countdown ("3 DAYS TIL GRAMMY!", then "HERE TOMORROW" / "HERE TODAY!" with the landing time).
+1. **Until their flight**, the screen shows them instead of the home/away screen: flag and "CHICAGO", local time and weather, and a countdown ("3 DAYS TIL GRAMMY!", then "HERE TOMORROW" / "HERE TODAY!" with the landing time).
 2. **During the flight**: "GRAMMY IS FLYING", progress bar, "ON THE WAY!".
 3. **After landing**: "GRAMMY LANDED!" for `landed_minutes`.
 4. Then everything goes back to normal by itself. You can untick the box afterwards (the status says when it's finished).

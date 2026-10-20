@@ -870,11 +870,10 @@ def fit_text(img, d, x0, x1, base, parts, t, center=False):
     img.paste(strip.crop((off, 0, off + avail, strip.height)), (x0, top))
 
 
-def draw_header(img, d, loc, t, who=None):
-    """Flag at left, city name to the right (scrolls if it's long); "WHO IS IN CITY" for a visitor."""
+def draw_header(img, d, loc, t):
+    """Flag at left, city name to the right (scrolls if it's long)."""
     city = ascii_only(loc["city"]).upper() if loc else "..."
-    parts = [(who + " IS IN ", WHITE), (city, CYAN)] if who else [(city, CYAN)]
-    fit_text(img, d, 20, W - 1, 9, parts, t)
+    fit_text(img, d, 20, W - 1, 9, [(city, CYAN)], t)
     draw_flag(img, d, 1, 1, loc.get("flag") if loc else None)
 
 
@@ -924,11 +923,11 @@ def draw_countdown(img, d, f, now, t):
         text(d, x, 64, ap, tiny, GREY)
 
 
-def screen_away(img, d, snap, now, t, who=None, nxt=None):
+def screen_away(img, d, snap, now, t, nxt=None):
     loc, wx = snap["loc"], snap["wx"]
     tz = ZoneInfo(wx["tz"]) if wx else HOME_TZ
     local = now.astimezone(tz)
-    draw_header(img, d, loc, t, who)
+    draw_header(img, d, loc, t)
 
     # local time, big
     hm, ap = clock(local)
@@ -956,7 +955,7 @@ def screen_away(img, d, snap, now, t, who=None, nxt=None):
 def screen_visitor(img, d, snap, now, t, v):
     """Temporary override: the visitor's place, time and weather, counting down to their flight."""
     f = v["flight"]
-    screen_away(img, d, {"loc": v["loc"], "wx": v["wx"]}, now, t, who=f["name"], nxt=f)
+    screen_away(img, d, {"loc": v["loc"], "wx": v["wx"]}, now, t, nxt=f)
 
 
 def screen_home(img, d, snap, now, t):
