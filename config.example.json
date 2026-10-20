@@ -14,6 +14,7 @@
   "temp_unit": "fahrenheit",
   "clock_24h": false,
   "airport_names": {},
+  "place_names": {},
 
   "location_every_s": 60,
   "calendar_every_s": 300,

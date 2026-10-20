@@ -127,6 +127,7 @@ To apply changes after editing, run `sudo systemctl restart flightwall`. To see 
 | `lookahead_days` | `90` | How far ahead to read the calendar; a flight home further out than this shows the date instead of a countdown |
 | `offline_after_s` | `90` | Seconds of failure before the offline screen appears |
 | `airport_names` | `{}` | Override city names, e.g. `{"XNA": "Bentonville"}` |
+| `place_names` | `{}` | Override city names from the map lookup, e.g. `{"City of Westminster": "London"}`. A leading "Greater " is dropped automatically ("Greater London" → "London"). |
 | `temp_unit` | `fahrenheit` | Or `celsius` |
 | `clock_24h` | `false` | `true` shows 17:30 instead of 5:30 PM |
 | `location_every_s` / `calendar_every_s` / `weather_every_s` | `60` / `300` / `600` | How often to poll HA location, the flight calendar, and weather |

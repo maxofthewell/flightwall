@@ -61,6 +61,7 @@ DEFAULTS = {
     "offline_after_s": 90,
     "leaving_soon_hours": 4,
     "airport_names": {},
+    "place_names": {},
     "temp_unit": "fahrenheit",
     "brightness": 60,
     "night_brightness": 15,
@@ -415,12 +416,23 @@ def _place(a):
     return city, (iso if cc == "us" and iso.startswith("us-") else cc)
 
 
+def place_name(city):
+    """Display name for a geocoded city: `place_names` overrides, else drop "Greater "
+    (OpenStreetMap names the London area "Greater London")."""
+    fixes = {k.upper(): v for k, v in CFG["place_names"].items()}
+    return fixes.get(city.upper()) or re.sub(r"^Greater\s+", "", city)
+
+
+def _named(row):
+    return (place_name(row[0]), *row[1:])
+
+
 def forward_geocode(q):
     """(city, flag, lat, lon) for a place name like "Chicago" or "Lyon, France"."""
     _geo_load()
     key = "q:" + q.strip().lower()
     if key in _geo_cache:
-        return tuple(_geo_cache[key])
+        return _named(_geo_cache[key])
     r = requests.get("https://nominatim.openstreetmap.org/search", timeout=15,
                      params={"q": q, "format": "jsonv2", "addressdetails": 1, "limit": 1,
                              "accept-language": "en"},
@@ -432,7 +444,7 @@ def forward_geocode(q):
     city, flag = _place(hits[0].get("address", {}))
     _geo_cache[key] = [city, flag, float(hits[0]["lat"]), float(hits[0]["lon"])]
     _geo_save()
-    return tuple(_geo_cache[key])
+    return _named(_geo_cache[key])
 
 
 def reverse_geocode(lat, lon):
@@ -440,7 +452,7 @@ def reverse_geocode(lat, lon):
     _geo_load()
     key = f"{lat:.2f},{lon:.2f}"
     if key in _geo_cache:
-        return tuple(_geo_cache[key])
+        return _named(_geo_cache[key])
     r = requests.get("https://nominatim.openstreetmap.org/reverse", timeout=15,
                      params={"lat": lat, "lon": lon, "format": "jsonv2",
                              "zoom": 10, "accept-language": "en"},
@@ -449,7 +461,7 @@ def reverse_geocode(lat, lon):
     city, flag = _place(r.json().get("address", {}))
     _geo_cache[key] = [city, flag]
     _geo_save()
-    return city, flag
+    return place_name(city), flag
 
 
 def fetch_weather(lat, lon):
@@ -1295,6 +1307,8 @@ SETTINGS = [
         ("clock_24h", "24-hour clock", "bool", None, ""),
         ("temp_unit", "Temperature", "choice", [("fahrenheit", "°F"), ("celsius", "°C")], ""),
         ("airport_names", "Airport name overrides", "dict", None, "one per line, e.g. XNA=Bentonville"),
+        ("place_names", "City name overrides", "dict", None,
+         "for odd names from the map lookup, one per line, e.g. City of Westminster=London"),
     ]),
     ("Home", [
         ("home.lat", "Latitude", "float", (-90, 90), ""),
