@@ -118,6 +118,8 @@ sudo ~/rpi-rgb-led-matrix/examples-api-use/demo -D0 --led-rows=64 --led-cols=64 
 
 ## Open ideas, not yet requested
 
+- **Flight data API (planned, Maxwell wants it "in the future")** for all flights + delay info, so the visitor only needs date, flight number and airports. Oct 2026 comparison: FlightAware AeroAPI Personal (no minimum; ~$5/mo usage credit, ~$10 for ADS-B feeders; schedules, delays, gates; personal use only) is the first choice if he feeds FlightAware; AeroDataBox Pro (~$5/mo, free ~400 units) second; FR24 API Explorer ($9/mo) is a separate purchase from his FR24 Contributor plan and seems live/historic only (no future schedules); AirLabs free ~1,000 calls but delay data unclear; aviationstack free tier too small. Expect ~30–50 calls per flight. First check whether Flighty already moves calendar event times on delays. Planned design: `flight_api` provider + key setting, API times override calendar/typed times, "DELAYED 25M" tag, typed/calendar times stay as fallback.
+
 - Verify the parser against real Flighty events once HA is reachable, and adjust `ROUTE` if needed.
 - Tune `gpio_slowdown` down (2–3) if the panel is clean.
 - A "landed in <city>" screen for non-Denver arrivals.
