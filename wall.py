@@ -74,6 +74,9 @@ DEFAULTS = {
     "gpio_slowdown": 4,
     "web_password": "",
     "web_port": 8080,
+    # temporary visitor override (settings page): times are home time, "YYYY-MM-DDTHH:MM"
+    "visitor": {"enabled": False, "name": "", "location": "", "flight": "",
+                "from": "", "to": "", "depart": "", "arrive": ""},
     "font_dir": "/home/mk/rpi-rgb-led-matrix/fonts",
 }
 
@@ -386,16 +389,55 @@ def km_between(lat1, lon1, lat2, lon2):
 _geo_cache = None
 
 
-def reverse_geocode(lat, lon):
-    """(city, flag_code) for a position; US -> state flag (us-co), else country (jp)."""
+def _geo_load():
     global _geo_cache
-    path = os.path.join(CACHE, "geocode.json")
     if _geo_cache is None:
         try:
-            with open(path) as fp:
+            with open(os.path.join(CACHE, "geocode.json")) as fp:
                 _geo_cache = json.load(fp)
         except Exception:
             _geo_cache = {}
+    return _geo_cache
+
+
+def _geo_save():
+    os.makedirs(CACHE, exist_ok=True)
+    with open(os.path.join(CACHE, "geocode.json"), "w") as fp:
+        json.dump(_geo_cache, fp)
+
+
+def _place(a):
+    """(city, flag) from a Nominatim address block."""
+    city = (a.get("city") or a.get("town") or a.get("village") or a.get("municipality")
+            or a.get("hamlet") or a.get("county") or a.get("state") or "?")
+    cc = a.get("country_code", "").lower()
+    iso = a.get("ISO3166-2-lvl4", "").lower()
+    return city, (iso if cc == "us" and iso.startswith("us-") else cc)
+
+
+def forward_geocode(q):
+    """(city, flag, lat, lon) for a place name like "Chicago" or "Lyon, France"."""
+    _geo_load()
+    key = "q:" + q.strip().lower()
+    if key in _geo_cache:
+        return tuple(_geo_cache[key])
+    r = requests.get("https://nominatim.openstreetmap.org/search", timeout=15,
+                     params={"q": q, "format": "jsonv2", "addressdetails": 1, "limit": 1,
+                             "accept-language": "en"},
+                     headers={"User-Agent": "FlightWall-LED/1.0 (personal home display)"})
+    r.raise_for_status()
+    hits = r.json()
+    if not hits:
+        raise ValueError(f"place not found: {q}")
+    city, flag = _place(hits[0].get("address", {}))
+    _geo_cache[key] = [city, flag, float(hits[0]["lat"]), float(hits[0]["lon"])]
+    _geo_save()
+    return tuple(_geo_cache[key])
+
+
+def reverse_geocode(lat, lon):
+    """(city, flag_code) for a position; US -> state flag (us-co), else country (jp)."""
+    _geo_load()
     key = f"{lat:.2f},{lon:.2f}"
     if key in _geo_cache:
         return tuple(_geo_cache[key])
@@ -404,16 +446,9 @@ def reverse_geocode(lat, lon):
                              "zoom": 10, "accept-language": "en"},
                      headers={"User-Agent": "FlightWall-LED/1.0 (personal home display)"})
     r.raise_for_status()
-    a = r.json().get("address", {})
-    city = (a.get("city") or a.get("town") or a.get("village") or a.get("municipality")
-            or a.get("hamlet") or a.get("county") or a.get("state") or "?")
-    cc = a.get("country_code", "").lower()
-    iso = a.get("ISO3166-2-lvl4", "").lower()
-    flag = iso if cc == "us" and iso.startswith("us-") else cc
+    city, flag = _place(r.json().get("address", {}))
     _geo_cache[key] = [city, flag]
-    os.makedirs(CACHE, exist_ok=True)
-    with open(path, "w") as fp:
-        json.dump(_geo_cache, fp)
+    _geo_save()
     return city, flag
 
 
@@ -567,7 +602,7 @@ def airport_city(code):
 
 
 # ---- background updater ------------------------------------------------------
-STATE = {"loc": None, "wx": None, "home_wx": None, "flights": [],
+STATE = {"visitor": {"q": None, "loc": None, "wx": None}, "loc": None, "wx": None, "home_wx": None, "flights": [],
          "net": {"status": "unknown", "ip": None, "fail_since": None},
          "ha": {"status": "unknown", "fail_since": None, "error": ""},
          "cal_error": ""}
@@ -605,13 +640,68 @@ def update_location():
     return loc
 
 
+def visitor_plan(now=None):
+    """The visitor's flight from the settings, or None if it's off, incomplete, or over
+    (landed more than `landed_minutes` ago)."""
+    v = CFG["visitor"]
+    if not v.get("enabled"):
+        return None
+    try:
+        start = datetime.fromisoformat(v["depart"]).replace(tzinfo=HOME_TZ)
+        end = datetime.fromisoformat(v["arrive"]).replace(tzinfo=HOME_TZ)
+    except (KeyError, TypeError, ValueError):
+        return None
+    if end <= start or (now and now >= end + timedelta(minutes=CFG["landed_minutes"])):
+        return None
+    origin, dest = (v.get("from") or "").upper() or None, (v.get("to") or "").upper() or None
+    return {"start": start, "end": end, "origin": origin, "dest": dest,
+            "number": (v.get("flight") or "").upper(), "home": dest in CFG["home"]["airports"],
+            "summary": "", "name": ascii_only(v.get("name") or "").upper() or "GUEST", "visitor": True}
+
+
+def visitor_query():
+    """Where the visitor is before the flight: the setting, else the departure airport's city."""
+    v = CFG["visitor"]
+    origin = (v.get("from") or "").upper()
+    return (v.get("location") or "").strip() or airport_city(origin) or origin
+
+
+def update_visitor():
+    """Geocode the visitor's place (once per name) and fetch its weather."""
+    q = visitor_query()
+    if not q:
+        return
+    with LOCK:
+        cur = dict(STATE["visitor"])
+    loc = cur["loc"] if cur["q"] == q else None
+    if loc is None:
+        city, flag, lat, lon = forward_geocode(q)
+        loc = {"city": city, "flag": flag, "lat": lat, "lon": lon, "at_home": False}
+        prefetch_flag(flag)
+        log("visitor location:", q, "->", city, flag)
+    wx = fetch_weather(loc["lat"], loc["lon"])
+    with LOCK:
+        STATE["visitor"] = {"q": q, "loc": loc, "wx": wx}
+
+
+def visitor_snapshot(now):
+    """What render() needs for the visitor, or None."""
+    f = visitor_plan(now)
+    if not f:
+        return None
+    with LOCK:
+        v = dict(STATE["visitor"])
+    fresh = v["q"] == visitor_query()
+    return {"flight": f, "loc": v["loc"] if fresh else None, "wx": v["wx"] if fresh else None}
+
+
 def data_loop():
-    due = {"net": 0, "loc": 0, "cal": 0, "wx": 0, "hwx": 0, "apt": 0}
+    due = {"net": 0, "loc": 0, "cal": 0, "wx": 0, "hwx": 0, "apt": 0, "vis": 0}
     while True:
         now = time.time()
         if REFRESH.is_set():
             REFRESH.clear()
-            due.update(net=0, loc=0, cal=0, wx=0, hwx=0)
+            due.update(net=0, loc=0, cal=0, wx=0, hwx=0, vis=0)
         if now >= due["apt"]:
             due["apt"] = float("inf") if prefetch_airports() else now + 3600
         if now >= due["net"]:
@@ -656,6 +746,16 @@ def data_loop():
             except Exception as e:
                 log("weather error:", e)
                 due["wx"] = now + 60
+        if visitor_plan(datetime.now(timezone.utc)):
+            with LOCK:
+                moved = STATE["visitor"]["q"] != visitor_query()
+            if now >= due["vis"] or moved:
+                try:
+                    update_visitor()
+                    due["vis"] = now + CFG["weather_every_s"]
+                except Exception as e:
+                    log("visitor update error:", e)
+                    due["vis"] = now + 120
         if now >= due["hwx"]:  # Denver weather, for the offline screen
             try:
                 hw = fetch_weather(CFG["home"]["lat"], CFG["home"]["lon"])
@@ -683,6 +783,15 @@ def pick_mode(snap, now):
     for f in flights:  # any booked flight, wherever it leaves from and wherever GPS says he is
         if now < f["start"] <= now + soon:
             return "leaving", f
+    v = snap.get("visitor")  # temporary override from the settings page
+    if v:
+        f = v["flight"]
+        if f["start"] <= now < f["end"]:
+            return "flying", f
+        if f["end"] <= now < f["end"] + timedelta(minutes=CFG["landed_minutes"]):
+            return "landed", f
+        if now < f["start"]:
+            return "visitor", v
     if snap.get("offline"):
         return "offline", snap["offline"]
     if snap["loc"] and snap["loc"]["at_home"]:
@@ -761,10 +870,11 @@ def fit_text(img, d, x0, x1, base, parts, t, center=False):
     img.paste(strip.crop((off, 0, off + avail, strip.height)), (x0, top))
 
 
-def draw_header(img, d, loc, t):
-    """Flag at left, city name to the right (scrolls if it's long)."""
+def draw_header(img, d, loc, t, who=None):
+    """Flag at left, city name to the right (scrolls if it's long); "WHO IS IN CITY" for a visitor."""
     city = ascii_only(loc["city"]).upper() if loc else "..."
-    fit_text(img, d, 20, W - 1, 9, [(city, CYAN)], t)
+    parts = [(who + " IS IN ", WHITE), (city, CYAN)] if who else [(city, CYAN)]
+    fit_text(img, d, 20, W - 1, 9, parts, t)
     draw_flag(img, d, 1, 1, loc.get("flag") if loc else None)
 
 
@@ -788,21 +898,23 @@ def draw_temp(img, d, x, base, temp, f):
 
 
 def draw_countdown(img, d, f, now, t):
-    """Bottom block (rows 48-63): days until Dada is home, or arrival time."""
+    """Bottom block (rows 48-63): days until Dada (or the visitor) arrives, or arrival time."""
     arr = f["end"].astimezone(HOME_TZ)
     days = (arr.date() - now.astimezone(HOME_TZ).date()).days
-    name = CFG["dad_name"]
+    name = f.get("name") or CFG["dad_name"]
     if days >= 2:
         big = font("9x15B")
         num = str(days)
-        right = [("DAYS TIL", font("5x7")), (name + "!", font("5x7"))]
+        nf = font("5x7") if big.width(num) + 3 + font("5x7").width(name + "!") <= W - 2 else font("4x6")
+        right = [("DAYS TIL", font("5x7")), (name + "!", nf)]
         rw = max(ff.width(s) for s, ff in right)
         x = (W - (big.width(num) + 3 + rw)) // 2
         x = text(d, x, 62, num, big, YELLOW) + 3
         text(d, x, 55, right[0][0], right[0][1], GREY)
         rainbow(d, x, 63, right[1][0], right[1][1], t)
     else:
-        label = "HOME TODAY!" if days <= 0 else "HOME TOMORROW"
+        word = ("HERE" if f["home"] else "LANDS") if f.get("visitor") else "HOME"
+        label = f"{word} TODAY!" if days <= 0 else f"{word} TOMORROW"
         ctext(d, 53, label, fit_font(label, 62, ("5x7", "4x6")), YELLOW if days <= 0 else CYAN)
         hm, ap = clock(arr)
         big = font("7x13B")
@@ -812,11 +924,11 @@ def draw_countdown(img, d, f, now, t):
         text(d, x, 64, ap, tiny, GREY)
 
 
-def screen_away(img, d, snap, now, t):
+def screen_away(img, d, snap, now, t, who=None, nxt=None):
     loc, wx = snap["loc"], snap["wx"]
     tz = ZoneInfo(wx["tz"]) if wx else HOME_TZ
     local = now.astimezone(tz)
-    draw_header(img, d, loc, t)
+    draw_header(img, d, loc, t, who)
 
     # local time, big
     hm, ap = clock(local)
@@ -834,11 +946,17 @@ def screen_away(img, d, snap, now, t):
         draw_temp(img, d, x + 15, 42, wx["temp"], f)
 
     d.line((6, 45, W - 7, 45), fill=DIM)
-    nxt = next_home_flight(snap, now)
+    nxt = nxt or next_home_flight(snap, now)
     if nxt:
         draw_countdown(img, d, nxt, now, t)
     else:
         ctext(d, 58, local.strftime("%a %b %d").upper().replace(" 0", " "), font("5x7"), GREY)
+
+
+def screen_visitor(img, d, snap, now, t, v):
+    """Temporary override: the visitor's place, time and weather, counting down to their flight."""
+    f = v["flight"]
+    screen_away(img, d, {"loc": v["loc"], "wx": v["wx"]}, now, t, who=f["name"], nxt=f)
 
 
 def screen_home(img, d, snap, now, t):
@@ -898,8 +1016,9 @@ def screen_flying(img, d, snap, now, t, f):
     total = (f["end"] - f["start"]).total_seconds()
     p = max(0.0, min(1.0, (now - f["start"]).total_seconds() / total))
     small, tiny = font("5x7"), font("4x6")
-    rainbow(d, (W - tiny.width(CFG["dad_name"] + " IS FLYING")) // 2, 6,
-            CFG["dad_name"] + " IS FLYING", tiny, t)
+    msg = (f.get("name") or CFG["dad_name"]) + " IS FLYING"
+    tf = fit_font(msg, W, ("4x6", "tom-thumb"))
+    rainbow(d, (W - tf.width(msg)) // 2, 6, msg, tf, t)
 
     draw_route(img, d, f, CYAN)
 
@@ -919,7 +1038,8 @@ def screen_flying(img, d, snap, now, t, f):
           small, WHITE)
     d.line((6, 46, W - 7, 46), fill=DIM)
     if f["home"]:
-        rainbow(d, (W - small.width("COMING HOME!")) // 2, 55, "COMING HOME!", small, t)
+        msg = "ON THE WAY!" if f.get("visitor") else "COMING HOME!"
+        rainbow(d, (W - small.width(msg)) // 2, 55, msg, small, t)
         hm, ap = clock(f["end"].astimezone(HOME_TZ))
         ctext(d, 63, f"LANDS {hm} {ap}".strip(), tiny, GREY)
     else:
@@ -930,9 +1050,9 @@ def screen_flying(img, d, snap, now, t, f):
 
 def screen_leaving(img, d, snap, now, t, f):
     """A booked flight takes off within `leaving_soon_hours`."""
-    tiny = font("4x6")
-    msg = CFG["dad_name"] + " FLIES SOON"
-    rainbow(d, (W - tiny.width(msg)) // 2, 6, msg, tiny, t)
+    msg = (f.get("name") or CFG["dad_name"]) + " FLIES SOON"
+    tf = fit_font(msg, W, ("4x6", "tom-thumb"))
+    rainbow(d, (W - tf.width(msg)) // 2, 6, msg, tf, t)
     draw_route(img, d, f, GREY)
     if f["home"]:
         msg = "COMING HOME!"
@@ -957,7 +1077,8 @@ def screen_landed(img, d, snap, now, t, f):
         d.line((x, 15, x + 2, 15), fill=GREY)
     bob = 1 if int(t * 2) % 2 else 0
     sprite(img, 8 + int(t * 6) % 40, 5 + bob, PLANE, {"X": CYAN})
-    ctext(d, 33, CFG["dad_name"], font("9x18B"), WHITE)
+    name = f.get("name") or CFG["dad_name"]
+    ctext(d, 33, name, fit_font(name, W - 2, ("9x18B", "7x13B", "5x7")), WHITE)
     msg = "LANDED!"
     rainbow(d, (W - font("7x13B").width(msg)) // 2, 47, msg, font("7x13B"), t)
     ctext(d, 59, "JUST NOW!" if mins < 1 else f"{mins} MIN AGO", font("5x7"), YELLOW)
@@ -1013,6 +1134,8 @@ def render(snap, now, t):
         screen_leaving(img, d, snap, now, t, f)
     elif mode == "offline":
         screen_offline(img, d, snap, now, t, f)
+    elif mode == "visitor":
+        screen_visitor(img, d, snap, now, t, f)
     elif mode == "home":
         screen_home(img, d, snap, now, t)
     else:
@@ -1043,6 +1166,11 @@ def demo_scenarios():
     def loc(city, flag, home=False):
         return {"state": "home" if home else "not_home", "lat": 0, "lon": 0,
                 "city": city, "flag": flag, "at_home": home}
+
+    def visitor(name, o, de, dep_h, dur_h, place, flag, wx_, num="WN 383"):
+        f = dict(fl(o, de, dep_h, dur_h, num), name=name, visitor=True)
+        return {"flight": f, "loc": {"city": place, "flag": flag, "lat": 0, "lon": 0, "at_home": False},
+                "wx": wx_}
 
     def wx(temp, code, day, tz, hi=None, lo=None):
         return {"temp": temp, "code": code, "is_day": day, "tz": tz, "hi": hi, "lo": lo}
@@ -1088,6 +1216,20 @@ def demo_scenarios():
                                 "flights": [fl("DEN", "SFO", 0.66, 2.4, "UA 552")]}, now),
         ("flying_elsewhere", {"loc": loc("London", "gb"), "wx": None,
                               "flights": [fl("LHR", "CDG", -0.4, 1.3, "AF 1681")]}, now),
+        ("visitor_waiting", {"loc": loc("Denver", "us-co", True), "wx": None, "flights": [],
+                             "visitor": visitor("GRAMMY", "MDW", "DEN", 24 * 3 + 1, 2.7, "Chicago", "us-il",
+                                                wx(55, 61, True, "America/Chicago"))}, now),
+        ("visitor_lands_tomorrow", {"loc": loc("Denver", "us-co", True), "wx": None, "flights": [],
+                           "visitor": visitor("GRANDPA", "LHR", "DEN", 1, 9.9, "London", "gb",
+                                              wx(48, 3, False, "Europe/London"), "BA 219")}, now),
+        ("visitor_flying", {"loc": loc("Denver", "us-co", True), "wx": None, "flights": [],
+                            "visitor": visitor("GRAMMY", "MDW", "DEN", -1.2, 2.7, "Chicago", "us-il", None)}, now),
+        ("visitor_landed", {"loc": loc("Denver", "us-co", True), "wx": None, "flights": [],
+                            "visitor": visitor("GRAMMY", "MDW", "DEN", -3, 2.7, "Chicago", "us-il", None)}, now),
+        ("visitor_but_dada_flying", {"loc": loc("Chicago", "us-il"), "wx": None,
+                                     "flights": [fl("ORD", "DEN", -1.0, 2.6, "UA 2211")],
+                                     "visitor": visitor("GRAMMY", "MDW", "DEN", 24, 2.7, "Chicago", "us-il",
+                                                        None)}, now),
         ("flying_long_name", {"loc": loc("Chicago", "us-il"), "wx": None,
                               "flights": [fl("ORD", "SLC", -1.0, 3.2, "DL 1402")]}, now),
     ]
@@ -1171,6 +1313,17 @@ SETTINGS = [
         ("rotate", "Rotate", "choice", [(0, "0°"), (90, "90°"), (180, "180°"), (270, "270°")], "clockwise"),
         ("gpio_slowdown", "GPIO slowdown", "int", (0, 5), "raise if you see sparkle/ghosting"),
     ]),
+    ("Visitor (temporary)", [
+        ("visitor.enabled", "Show a visitor", "bool", None,
+         "replaces the home/away screen until their flight lands; Dada's own flights still come first"),
+        ("visitor.name", "Name", "text", None, "e.g. GRAMMY"),
+        ("visitor.location", "Where they are now", "text", None, "e.g. Chicago; blank = the departure airport's city"),
+        ("visitor.flight", "Flight number", "text", None, "e.g. WN 383 (optional)"),
+        ("visitor.from", "From airport", "iata", None, "e.g. MDW"),
+        ("visitor.to", "To airport", "iata", None, "e.g. DEN"),
+        ("visitor.depart", "Departs", "datetime", None, f"home time ({CFG['home']['tz']})"),
+        ("visitor.arrive", "Lands", "datetime", None, f"home time ({CFG['home']['tz']})"),
+    ]),
     ("Polling", [
         ("location_every_s", "Location every (s)", "int", (10, 3600), ""),
         ("calendar_every_s", "Calendar every (s)", "int", (30, 86400), ""),
@@ -1238,12 +1391,27 @@ def parse_settings(form):
                 elif kind == "tz":
                     ZoneInfo(raw)
                     out[key] = raw
+                elif kind == "iata":
+                    if raw and not re.fullmatch(r"[A-Za-z]{3}", raw):
+                        raise ValueError("use a 3-letter airport code, e.g. DEN")
+                    out[key] = raw.upper()
+                elif kind == "datetime":
+                    if raw:
+                        datetime.fromisoformat(raw)  # "2026-10-24T14:05" from the browser
+                    out[key] = raw[:16]
                 else:
                     if not raw and key in ("ha_url", "person_entity", "flight_calendar", "dad_name"):
                         raise ValueError("can't be empty")
                     out[key] = raw
             except Exception as e:
                 errors.append(f"{label}: {e}")
+    if out.get("visitor.enabled") and not errors:  # the visitor needs a complete flight
+        missing = [k.split(".")[1] for k in ("visitor.name", "visitor.from", "visitor.to",
+                                              "visitor.depart", "visitor.arrive") if not out.get(k)]
+        if missing:
+            errors.append("Visitor: fill in " + ", ".join(missing))
+        elif out["visitor.arrive"] <= out["visitor.depart"]:
+            errors.append("Visitor: landing has to be after departure")
     return out, errors
 
 
@@ -1300,6 +1468,20 @@ def _status_rows():
     if wx:
         hl = f", high {wx['hi']} / low {wx['lo']}" if wx.get("hi") is not None else ""
         rows.append(("Weather", f"{wx['temp']}°{hl}"))
+    v = snap.get("visitor")
+    if v:
+        f = v["flight"]
+        when = lambda t: f"{t.astimezone(HOME_TZ):%a %b %d %I:%M %p}"
+        place = v["loc"]["city"] if v["loc"] else visitor_query() + " (looking up...)"
+        if now < f["start"]:
+            state = f"in {place}, flies {when(f['start'])}"
+        elif now < f["end"]:
+            state = f"flying, lands {when(f['end'])}"
+        else:
+            state = "landed"
+        rows.append(("Visitor", f"{f['name']}: {state}"))
+    elif CFG["visitor"].get("enabled"):
+        rows.append(("Visitor", "finished - you can switch it off"))
     upcoming = [f for f in snap["flights"] if f["end"] > now][:3]
     for f in upcoming:
         rows.append(("Flight", f"{f['start'].astimezone(HOME_TZ):%a %b %d %I:%M %p}  "
@@ -1320,7 +1502,7 @@ h2{font-size:15px;margin:0 0 8px;color:var(--mut);text-transform:uppercase;lette
 .preview{display:block;width:100%;max-width:384px;margin:0 auto;border-radius:6px;image-rendering:pixelated}
 table{width:100%;border-collapse:collapse}td{padding:3px 0;vertical-align:top}td:first-child{color:var(--mut);width:38%}
 label{display:block;margin:10px 0 2px;font-weight:600}.help{color:var(--mut);font-size:13px}
-input[type=text],input[type=password],input[type=number],select,textarea{width:100%;padding:8px;font:inherit;
+input[type=text],input[type=password],input[type=number],input[type=datetime-local],select,textarea{width:100%;padding:8px;font:inherit;
  border:1px solid var(--line);border-radius:6px;background:var(--bg);color:var(--fg)}
 textarea{min-height:70px}.check{display:flex;gap:8px;align-items:center;font-weight:600;margin:12px 0 2px}
 button{font:inherit;font-weight:600;padding:10px 16px;border:0;border-radius:8px;background:var(--acc);color:#fff}
@@ -1330,7 +1512,8 @@ button.alt{background:var(--line);color:var(--fg)}.msg{padding:10px 12px;border-
 """
 
 
-def settings_page(msg="", errors=()):
+def settings_page(msg="", errors=(), form=None):
+    """The page; after a rejected save, `form` (what was submitted) refills the fields."""
     e = html.escape
     out = ["<!doctype html><html><head><meta charset=utf-8>",
            "<meta name=viewport content='width=device-width,initial-scale=1'>",
@@ -1348,6 +1531,9 @@ def settings_page(msg="", errors=()):
         out.append(f"<section><h2>{e(group)}</h2>")
         for key, label, kind, extra, hlp in fields:
             v = _cfg_get(CFG, key)
+            raw = form.get(key, [""])[0] if form is not None else None
+            if raw is not None and kind == "bool":
+                v = raw == "on"
             name = e(key)
             if kind == "bool":
                 out.append(f"<label class=check><input type=checkbox name='{name}'"
@@ -1359,15 +1545,18 @@ def settings_page(msg="", errors=()):
                     out.append(f"<input type=password id='{name}' name='{name}' placeholder='{ph}' "
                                "autocomplete=new-password>")
                 elif kind == "choice":
-                    opts = "".join(f"<option value='{e(str(o))}'{' selected' if o == v else ''}>{e(t)}</option>"
+                    pick = raw if raw is not None else str(v)
+                    opts = "".join(f"<option value='{e(str(o))}'{' selected' if str(o) == pick else ''}>{e(t)}</option>"
                                    for o, t in extra)
                     out.append(f"<select id='{name}' name='{name}'>{opts}</select>")
                 elif kind == "dict":
-                    txt = "\n".join(f"{k}={c}" for k, c in (v or {}).items())
+                    txt = raw if raw is not None else "\n".join(f"{k}={c}" for k, c in (v or {}).items())
                     out.append(f"<textarea id='{name}' name='{name}'>{e(txt)}</textarea>")
                 else:
-                    shown = ", ".join(v) if kind == "list" else ("" if v is None else str(v))
-                    typ = "number' step='any" if kind in ("int", "float") else "text"
+                    shown = raw if raw is not None else (", ".join(v) if kind == "list"
+                                                         else ("" if v is None else str(v)))
+                    typ = {"int": "number' step='any", "float": "number' step='any",
+                           "datetime": "datetime-local"}.get(kind, "text")
                     out.append(f"<input type='{typ}' id='{name}' name='{name}' value='{e(shown)}'>")
             if hlp:
                 out.append(f"<div class=help>{e(hlp)}</div>")
@@ -1436,7 +1625,7 @@ class SettingsHandler(BaseHTTPRequestHandler):
         elif path == "/save":
             changes, errors = parse_settings(form)
             if errors:
-                return self._send(settings_page(errors=errors))
+                return self._send(settings_page(errors=errors, form=form))
             try:
                 restart = save_settings(changes)
             except Exception as e:
@@ -1578,6 +1767,11 @@ def diagnose():
         bad(f"weather failed: {str(e)[:100]}")
 
     now = datetime.now(timezone.utc)
+    vf = visitor_plan(now)
+    if vf:
+        print(f"\nVISITOR\n  {vf['name']} {vf['origin']}->{vf['dest']} {vf['number']}, "
+              f"departs {vf['start'].astimezone(HOME_TZ):%a %b %d %I:%M %p}, "
+              f"lands {vf['end'].astimezone(HOME_TZ):%I:%M %p} (waiting in {visitor_query()})")
     print("\nSCREEN NOW:", pick_mode({"loc": loc, "flights": fl, "wx": None}, now)[0].upper(), "\n")
 
 
@@ -1624,6 +1818,7 @@ def main():
                     "flights": list(STATE["flights"]),
                     "offline": offline_reason(net, ha, cal_err, time.time()),
                     "degraded": degraded(net, ha, cal_err)}
+        snap["visitor"] = visitor_snapshot(now)
         try:
             img = render(snap, now, time.time() - t0)
         except Exception as e:  # never let a drawing bug kill the display

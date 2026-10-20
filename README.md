@@ -136,6 +136,7 @@ To apply changes after editing, run `sudo systemctl restart flightwall`. To see 
 | `gpio_slowdown` | `4` | Lower (2–3) refreshes faster; raise it if you see sparkle or ghosting |
 | `web_password` | `""` | Password for the settings page. The page is off until you set this. |
 | `web_port` | `8080` | Port for the settings page |
+| `visitor` | off | Temporary visitor screen; easiest to set on the settings page (see below) |
 | `font_dir` | `/home/mk/rpi-rgb-led-matrix/fonts` | BDF fonts from the LED library |
 | `all_events_are_flights` | `false` | Treat every calendar event as a flight |
 
@@ -146,6 +147,17 @@ Set `web_password` in `config.json` and restart. Then open `http://<pi-ip>:8080/
 Most changes apply as soon as you press **Save**. Changing `gpio_slowdown`, the home time zone or the port restarts the display automatically. Saving rewrites `config.json`: other keys are kept, and the file keeps its owner and is set to mode 600, since it holds the HA token. The token and password are never sent to the browser; leave those boxes blank to keep them.
 
 It's plain HTTP with Basic auth, so keep it on your LAN (no port forward). Use your VPN to reach it from outside.
+
+## Visitor (temporary override)
+
+For Grandma's trip, say. In the settings page's **Visitor** section, tick **Show a visitor** and fill in their name, where they are (or leave it blank to use the departure airport's city), the flight number, the from/to airports, and departure and landing times (home time). Then:
+
+1. **Until their flight**, the screen shows them instead of the home/away screen: flag, "GRAMMY IS IN CHICAGO", local time and weather, and a countdown ("3 DAYS TIL GRAMMY!", then "HERE TOMORROW" / "HERE TODAY!" with the landing time).
+2. **During the flight**: "GRAMMY IS FLYING", progress bar, "ON THE WAY!".
+3. **After landing**: "GRAMMY LANDED!" for `landed_minutes`.
+4. Then everything goes back to normal by itself. You can untick the box afterwards (the status says when it's finished).
+
+Dada's own flights always come first: if one of his flights is about to leave, in the air, or just landed, that screen shows instead.
 
 ## Commands
 
