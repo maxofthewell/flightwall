@@ -151,7 +151,7 @@ It's plain HTTP with Basic auth, so keep it on your LAN (no port forward). Use y
 
 ## Visitor (temporary override)
 
-For Grandma's trip, say. In the settings page's **Visitor** section, tick **Show a visitor** and fill in their name, where they are (or leave it blank to use the departure airport's city), the flight number, the from/to airports, and departure and landing times (home time). Then:
+For Grandma's trip, say. In the settings page's **Visitor** section, tick **Show a visitor** and fill in their name, where they are (or leave it blank to use the departure airport's city), the flight number, the from/to airports, and departure and landing times in **local airport time**, as printed on the ticket (departure in the departure airport's time zone, landing in the arrival airport's). The time zones are looked up from the airports when you save; a landing before takeoff or a flight over 22 hours is rejected as a likely date mistake. Then:
 
 1. **Until their flight**, the screen shows them instead of the home/away screen: flag and "CHICAGO", local time and weather, and a countdown ("3 DAYS TIL GRAMMY!", then "HERE TOMORROW" / "HERE TODAY!" with the landing time).
 2. **During the flight**: "GRAMMY IS FLYING", progress bar, "ON THE WAY!".

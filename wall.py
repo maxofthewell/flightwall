@@ -75,9 +75,10 @@ DEFAULTS = {
     "gpio_slowdown": 4,
     "web_password": "",
     "web_port": 8080,
-    # temporary visitor override (settings page): times are home time, "YYYY-MM-DDTHH:MM"
+    # temporary visitor override (settings page): local airport times, "YYYY-MM-DDTHH:MM"
     "visitor": {"enabled": False, "name": "", "location": "", "flight": "",
-                "from": "", "to": "", "depart": "", "arrive": ""},
+                "from": "", "to": "", "depart": "", "arrive": "",
+                "depart_tz": "", "arrive_tz": ""},  # local airport times; zones filled in on save
     "font_dir": "/home/mk/rpi-rgb-led-matrix/fonts",
 }
 
@@ -573,14 +574,18 @@ def _airports_path():
     return os.path.join(CACHE, "airports.json")
 
 
+def _coords_path():
+    return os.path.join(CACHE, "airport_coords.json")  # {IATA: [lat, lon]}
+
+
 def prefetch_airports():
-    """Build {IATA: city} from OurAirports once; a few MB, cached forever."""
-    if os.path.exists(_airports_path()):
+    """Build {IATA: city} and {IATA: [lat, lon]} from OurAirports once; a few MB, cached forever."""
+    if os.path.exists(_airports_path()) and os.path.exists(_coords_path()):
         return True
     try:
         r = requests.get(AIRPORTS_URL, timeout=90)
         r.raise_for_status()
-        table = {}
+        table, coords = {}, {}
         for row in csv.DictReader(io.StringIO(r.text)):
             code = (row.get("iata_code") or "").strip().upper()
             city = (row.get("municipality") or "").strip()
@@ -589,9 +594,15 @@ def prefetch_airports():
             big = row.get("type") in ("large_airport", "medium_airport")
             if code not in table or big:
                 table[code] = city.split(",")[-1].strip()  # "Ota, Tokyo" -> "Tokyo"
+                try:
+                    coords[code] = [float(row["latitude_deg"]), float(row["longitude_deg"])]
+                except (KeyError, ValueError):
+                    pass
         os.makedirs(CACHE, exist_ok=True)
         with open(_airports_path(), "w") as fp:
             json.dump(table, fp)
+        with open(_coords_path(), "w") as fp:
+            json.dump(coords, fp)
         log(f"airport names downloaded ({len(table)} airports)")
         return True
     except Exception as e:
@@ -611,6 +622,57 @@ def airport_city(code):
         with open(_airports_path()) as fp:
             _airports = json.load(fp)
     return (_airports or {}).get(code)
+
+
+_coords = None
+_tz_lock = threading.Lock()
+
+
+def airport_tz(code):
+    """IANA time zone of an airport ("America/Chicago"): home airports use home.tz; others come
+    from the airport's coordinates via Open-Meteo, cached in .cache/airport_tz.json."""
+    global _coords
+    code = (code or "").upper()
+    if code in CFG["home"]["airports"]:
+        return CFG["home"]["tz"]
+    path = os.path.join(CACHE, "airport_tz.json")
+    with _tz_lock:
+        try:
+            with open(path) as fp:
+                cache = json.load(fp)
+        except Exception:
+            cache = {}
+        if code in cache:
+            return cache[code]
+        if _coords is None:
+            if not os.path.exists(_coords_path()):
+                prefetch_airports()
+            if os.path.exists(_coords_path()):
+                with open(_coords_path()) as fp:
+                    _coords = json.load(fp)
+        if not (_coords or {}).get(code):
+            raise ValueError(f"unknown airport {code}")
+        lat, lon = _coords[code]
+        d = requests.get("https://api.open-meteo.com/v1/forecast", timeout=15, params={
+            "latitude": lat, "longitude": lon, "current": "is_day", "timezone": "auto"}).json()
+        tz = d["timezone"]
+        ZoneInfo(tz)  # make sure it's a real zone
+        cache[code] = tz
+        os.makedirs(CACHE, exist_ok=True)
+        with open(path, "w") as fp:
+            json.dump(cache, fp)
+        return tz
+
+
+def visitor_zones(origin, dest):
+    """{"visitor.depart_tz", "visitor.arrive_tz"} for two airport codes, or raises with a reason."""
+    out = {}
+    for key, code in (("visitor.depart_tz", origin), ("visitor.arrive_tz", dest)):
+        try:
+            out[key] = airport_tz(code)
+        except Exception as e:
+            raise ValueError(f"couldn't find the time zone for {code} ({e})")
+    return out
 
 
 # ---- background updater ------------------------------------------------------
@@ -659,8 +721,9 @@ def visitor_plan(now=None):
     if not v.get("enabled"):
         return None
     try:
-        start = datetime.fromisoformat(v["depart"]).replace(tzinfo=HOME_TZ)
-        end = datetime.fromisoformat(v["arrive"]).replace(tzinfo=HOME_TZ)
+        # local times at each airport (as on the ticket); home time until the zones are known
+        start = datetime.fromisoformat(v["depart"]).replace(tzinfo=ZoneInfo(v.get("depart_tz") or CFG["home"]["tz"]))
+        end = datetime.fromisoformat(v["arrive"]).replace(tzinfo=ZoneInfo(v.get("arrive_tz") or CFG["home"]["tz"]))
     except (KeyError, TypeError, ValueError):
         return None
     if end <= start or (now and now >= end + timedelta(minutes=CFG["landed_minutes"])):
@@ -708,7 +771,7 @@ def visitor_snapshot(now):
 
 
 def data_loop():
-    due = {"net": 0, "loc": 0, "cal": 0, "wx": 0, "hwx": 0, "apt": 0, "vis": 0}
+    due = {"net": 0, "loc": 0, "cal": 0, "wx": 0, "hwx": 0, "apt": 0, "vis": 0, "vtz": 0}
     while True:
         now = time.time()
         if REFRESH.is_set():
@@ -758,6 +821,14 @@ def data_loop():
             except Exception as e:
                 log("weather error:", e)
                 due["wx"] = now + 60
+        vc = CFG["visitor"]
+        if vc.get("enabled") and not (vc.get("depart_tz") and vc.get("arrive_tz")) and now >= due["vtz"]:
+            try:  # saved by an older version: look up the airports' zones once and store them
+                save_settings(visitor_zones(vc.get("from"), vc.get("to")))
+                log("visitor time zones:", CFG["visitor"]["depart_tz"], "->", CFG["visitor"]["arrive_tz"])
+            except Exception as e:
+                log("visitor time zones:", e)
+                due["vtz"] = now + 600
         if visitor_plan(datetime.now(timezone.utc)):
             with LOCK:
                 moved = STATE["visitor"]["q"] != visitor_query()
@@ -1334,8 +1405,8 @@ SETTINGS = [
         ("visitor.flight", "Flight number", "text", None, "e.g. WN 383 (optional)"),
         ("visitor.from", "From airport", "iata", None, "e.g. MDW"),
         ("visitor.to", "To airport", "iata", None, "e.g. DEN"),
-        ("visitor.depart", "Departs", "datetime", None, f"home time ({CFG['home']['tz']})"),
-        ("visitor.arrive", "Lands", "datetime", None, f"home time ({CFG['home']['tz']})"),
+        ("visitor.depart", "Departs", "datetime", None, "local time at the departure airport, as on the ticket"),
+        ("visitor.arrive", "Lands", "datetime", None, "local time at the arrival airport, as on the ticket"),
     ]),
     ("Polling", [
         ("location_every_s", "Location every (s)", "int", (10, 3600), ""),
@@ -1423,8 +1494,6 @@ def parse_settings(form):
                                               "visitor.depart", "visitor.arrive") if not out.get(k)]
         if missing:
             errors.append("Visitor: fill in " + ", ".join(missing))
-        elif out["visitor.arrive"] <= out["visitor.depart"]:
-            errors.append("Visitor: landing has to be after departure")
     return out, errors
 
 
@@ -1484,10 +1553,13 @@ def _status_rows():
     v = snap.get("visitor")
     if v:
         f = v["flight"]
-        when = lambda t: f"{t.astimezone(HOME_TZ):%a %b %d %I:%M %p}"
+        def when(t):
+            h = t.astimezone(HOME_TZ)
+            same = h.utcoffset() == t.utcoffset()
+            return f"{t:%a %b %d %I:%M %p} {t.tzname()}" + ("" if same else f" ({h:%I:%M %p} {h.tzname()})")
         place = v["loc"]["city"] if v["loc"] else visitor_query() + " (looking up...)"
         if now < f["start"]:
-            state = f"in {place}, flies {when(f['start'])}"
+            state = f"in {place}, flies {when(f['start'])}, lands {when(f['end'])}"
         elif now < f["end"]:
             state = f"flying, lands {when(f['end'])}"
         else:
@@ -1637,6 +1709,22 @@ class SettingsHandler(BaseHTTPRequestHandler):
             threading.Timer(1, restart_self).start()
         elif path == "/save":
             changes, errors = parse_settings(form)
+            if not errors and changes.get("visitor.enabled"):
+                try:
+                    changes.update(visitor_zones(changes["visitor.from"], changes["visitor.to"]))
+                    dep = datetime.fromisoformat(changes["visitor.depart"]).replace(
+                        tzinfo=ZoneInfo(changes["visitor.depart_tz"]))
+                    arr = datetime.fromisoformat(changes["visitor.arrive"]).replace(
+                        tzinfo=ZoneInfo(changes["visitor.arrive_tz"]))
+                    hours = (arr - dep).total_seconds() / 3600
+                    if hours <= 0:
+                        errors.append("Visitor: with the airports' time zones, landing is before takeoff - "
+                                      "check the dates (overnight flights land the next day)")
+                    elif not 1 / 3 <= hours <= 22:
+                        errors.append(f"Visitor: that's a {hours:.1f}-hour flight in real time - check the "
+                                      "dates and times (they're local at each airport)")
+                except Exception as e:
+                    errors.append(f"Visitor: {e}")
             if errors:
                 return self._send(settings_page(errors=errors, form=form))
             try:
@@ -1783,8 +1871,10 @@ def diagnose():
     vf = visitor_plan(now)
     if vf:
         print(f"\nVISITOR\n  {vf['name']} {vf['origin']}->{vf['dest']} {vf['number']}, "
-              f"departs {vf['start'].astimezone(HOME_TZ):%a %b %d %I:%M %p}, "
-              f"lands {vf['end'].astimezone(HOME_TZ):%I:%M %p} (waiting in {visitor_query()})")
+              f"departs {vf['start']:%a %b %d %I:%M %p} {vf['start'].tzname()}, "
+              f"lands {vf['end']:%a %I:%M %p} {vf['end'].tzname()} "
+              f"= {vf['start'].astimezone(HOME_TZ):%a %I:%M %p} -> {vf['end'].astimezone(HOME_TZ):%a %I:%M %p} "
+              f"{vf['end'].astimezone(HOME_TZ).tzname()} (waiting in {visitor_query()})")
     print("\nSCREEN NOW:", pick_mode({"loc": loc, "flights": fl, "wx": None}, now)[0].upper(), "\n")
 
 
