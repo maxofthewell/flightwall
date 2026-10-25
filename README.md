@@ -124,6 +124,7 @@ To apply changes after editing, run `sudo systemctl restart flightwall`. To see 
 | `dad_name` | `DADA` | Name shown on screen |
 | `leaving_soon_hours` | `4` | Hours before any booked flight that the "flies soon" screen starts (decimals OK, e.g. `2.5`; up to 168) |
 | `landed_minutes` | `90` | Minutes after landing in Denver that the "landed" screen stays up |
+| `home_banner_hours` | `6` | Hours after landing in Denver that "DADA IS HOME!" stays up (after the landed screen). After that, or if he got home without a flight, the home screen shows the clock, weather, high/low and a 3-day forecast. `0` = never show the banner. |
 | `lookahead_days` | `90` | How far ahead to read the calendar; a flight home further out than this shows the date instead of a countdown |
 | `offline_after_s` | `90` | Seconds of failure before the offline screen appears |
 | `airport_names` | `{}` | Override city names, e.g. `{"XNA": "Bentonville"}` |

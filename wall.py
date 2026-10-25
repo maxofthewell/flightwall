@@ -57,6 +57,7 @@ DEFAULTS = {
              "airports": ["DEN"], "city_word": "denver", "tz": "America/Denver"},
     "dad_name": "DADA",
     "landed_minutes": 90,
+    "home_banner_hours": 6,
     "lookahead_days": 90,
     "offline_after_s": 90,
     "leaving_soon_hours": 4,
@@ -469,12 +470,19 @@ def fetch_weather(lat, lon):
     d = requests.get("https://api.open-meteo.com/v1/forecast", timeout=15, params={
         "latitude": lat, "longitude": lon,
         "current": "temperature_2m,weather_code,is_day",
-        "daily": "temperature_2m_max,temperature_2m_min", "forecast_days": 1,
+        "daily": "temperature_2m_max,temperature_2m_min,weather_code", "forecast_days": 4,
         "temperature_unit": CFG["temp_unit"], "timezone": "auto"}).json()
     c, day = d["current"], d.get("daily", {})
-    hi, lo = (day.get("temperature_2m_max") or [None])[0], (day.get("temperature_2m_min") or [None])[0]
-    return {"temp": round(c["temperature_2m"]), "code": c["weather_code"],
-            "hi": None if hi is None else round(hi), "lo": None if lo is None else round(lo),
+    days = []  # today first, then the next 3 days
+    for i, date in enumerate(day.get("time") or []):
+        try:
+            mx, mn = day["temperature_2m_max"][i], day["temperature_2m_min"][i]
+            days.append({"date": date, "code": day["weather_code"][i], "hi": round(mx), "lo": round(mn),
+                         "avg": round((mx + mn) / 2)})
+        except (KeyError, IndexError, TypeError):
+            pass
+    hi, lo = (days[0]["hi"], days[0]["lo"]) if days else (None, None)
+    return {"temp": round(c["temperature_2m"]), "code": c["weather_code"], "hi": hi, "lo": lo, "days": days,
             "is_day": bool(c["is_day"]), "tz": d["timezone"], "at": (lat, lon), "ts": time.time()}
 
 
@@ -878,7 +886,10 @@ def pick_mode(snap, now):
     if snap.get("offline"):
         return "offline", snap["offline"]
     if snap["loc"] and snap["loc"]["at_home"]:
-        return "home", None
+        landed = [f["end"] for f in flights if f["home"] and f["end"] <= now]
+        if landed and now - max(landed) < timedelta(hours=CFG["home_banner_hours"]):
+            return "home", None  # "DADA IS HOME!" for a while after he lands
+        return "home_weather", None
     return "away", None
 
 
@@ -1059,7 +1070,13 @@ def screen_home(img, d, snap, now, t):
     d.line((6, 33, W - 7, 33), fill=DIM)
     wx = snap["wx"]
     hilo = wx and wx.get("hi") is not None and wx.get("lo") is not None
-    base = 46 if hilo else 50  # clock row moves up to make room for HI / LO
+    draw_clock_weather(img, d, 46 if hilo else 50, local, wx)  # clock row moves up for HI / LO
+    if hilo:
+        draw_hilo(img, d, 56, wx)
+
+
+def draw_clock_weather(img, d, base, local, wx):
+    """One row: the biggest clock that fits, then the weather icon and temperature."""
     hm, _ = clock(local)
     ww = 12 + 2 + font("5x7").width(str(wx["temp"])) + 4 if wx else 0
     for name in ("7x13", "6x10", "5x7"):  # biggest clock that fits next to the weather
@@ -1072,8 +1089,31 @@ def screen_home(img, d, snap, now, t):
         x += 5
         weather_icon(img, d, x, base - 11, wx["code"], wx["is_day"])
         draw_temp(img, d, x + 14, base, wx["temp"], font("5x7"))
-    if hilo:
-        draw_hilo(img, d, 56, wx)
+
+
+def screen_home_weather(img, d, snap, now, t):
+    """Home, after the "IS HOME!" banner: clock + weather on top, the next 3 days below."""
+    local = now.astimezone(HOME_TZ)
+    wx = snap["wx"]
+    draw_clock_weather(img, d, 13, local, wx)
+    if wx and wx.get("hi") is not None and wx.get("lo") is not None:
+        draw_hilo(img, d, 23, wx)
+    d.line((6, 27, W - 7, 27), fill=DIM)
+    days = (wx or {}).get("days", [])[1:4]
+    if not days:  # no forecast (yet): just the date
+        ctext(d, 44, local.strftime("%a %b %d").upper().replace(" 0", " "), font("5x7"), GREY)
+        return
+    # three columns: day, icon, average temperature; nothing below row 55 (frame edge)
+    tiny, num = font("4x6"), font("5x7")
+    col = W // len(days)
+    for i, day in enumerate(days):
+        x0 = i * col
+        name = datetime.strptime(day["date"], "%Y-%m-%d").strftime("%a").upper()
+        ctext(d, 35, name, tiny, CYAN if i == 0 else GREY, x0, x0 + col)
+        weather_icon(img, d, x0 + (col - 12) // 2, 37, day["code"], True)
+        tf = num if num.width(str(day["avg"])) + 4 <= col else tiny
+        w = tf.width(str(day["avg"])) + 4
+        draw_temp(img, d, x0 + (col - w) // 2, 55, day["avg"], tf)
 
 
 def draw_hilo(img, d, base, wx):
@@ -1220,6 +1260,8 @@ def render(snap, now, t):
         screen_visitor(img, d, snap, now, t, f)
     elif mode == "home":
         screen_home(img, d, snap, now, t)
+    elif mode == "home_weather":
+        screen_home_weather(img, d, snap, now, t)
     else:
         screen_away(img, d, snap, now, t)
     if mode != "offline" and snap.get("degraded") and int(t * 2) % 2:
@@ -1254,8 +1296,10 @@ def demo_scenarios():
         return {"flight": f, "loc": {"city": place, "flag": flag, "lat": 0, "lon": 0, "at_home": False},
                 "wx": wx_}
 
-    def wx(temp, code, day, tz, hi=None, lo=None):
-        return {"temp": temp, "code": code, "is_day": day, "tz": tz, "hi": hi, "lo": lo}
+    def wx(temp, code, day, tz, hi=None, lo=None, days=()):
+        dates = [(now.astimezone(HOME_TZ) + timedelta(days=i)).strftime("%Y-%m-%d") for i in range(4)]
+        return {"temp": temp, "code": code, "is_day": day, "tz": tz, "hi": hi, "lo": lo,
+                "days": [{"date": dt, "code": c, "avg": a} for dt, (c, a) in zip(dates, days)]}
 
     return [
         ("away_tokyo_5days", {"loc": loc("Tokyo", "jp"), "wx": wx(71, 0, False, "Asia/Tokyo"),
@@ -1276,10 +1320,18 @@ def demo_scenarios():
                          "flights": [fl("DEN", "LHR", -2.5, 9.5, "BA 218")]}, now),
         ("landed", {"loc": loc("Denver", "us-co", True), "wx": None,
                     "flights": [fl("ORD", "DEN", -2.8, 2.6, "UA 2211")]}, now),
-        ("home", {"loc": loc("Denver", "us-co", True),
-                  "wx": wx(72, 1, True, "America/Denver", 78, 49), "flights": []}, now),
+        ("home", {"loc": loc("Denver", "us-co", True),  # landed 3 h ago: banner
+                  "wx": wx(72, 1, True, "America/Denver", 78, 49), "flights": [fl("ORD", "DEN", -5.6, 2.6)]}, now),
         ("home_cold", {"loc": loc("Denver", "us-co", True),
-                       "wx": wx(-4, 73, True, "America/Denver", 12, -11), "flights": []}, now),
+                       "wx": wx(-4, 73, True, "America/Denver", 12, -11), "flights": [fl("ORD", "DEN", -5.6, 2.6)]}, now),
+        ("home_weather", {"loc": loc("Denver", "us-co", True),  # home for days: forecast
+                          "wx": wx(72, 1, True, "America/Denver", 78, 49,
+                                   [(1, 63), (0, 70), (61, 55), (95, 58)]), "flights": []}, now),
+        ("home_weather_cold", {"loc": loc("Denver", "us-co", True),
+                               "wx": wx(-4, 73, True, "America/Denver", 12, -11,
+                                        [(73, -8), (3, -15), (0, 2), (45, 31)]), "flights": []}, now),
+        ("home_weather_no_forecast", {"loc": loc("Denver", "us-co", True),
+                                      "wx": wx(72, 1, True, "America/Denver", 78, 49), "flights": []}, now),
         ("offline_no_ha", {"loc": None, "wx": None, "flights": [],
                            "home_wx": wx(72, 1, True, "America/Denver"),
                            "offline": ("NO HA", "CONNECTIVITY", "192.168.129.57")}, now),
@@ -1373,6 +1425,8 @@ SETTINGS = [
         ("dad_name", "Name on screen", "text", None, ""),
         ("leaving_soon_hours", '"Flies soon" starts (hours before takeoff)', "float", (0, 168), "any flight, from anywhere"),
         ("landed_minutes", '"Landed" stays up (minutes after landing)', "int", (0, 1440), ""),
+        ("home_banner_hours", '"Is home!" stays up (hours after landing)', "float", (0, 48),
+         "then the home screen shows the clock, weather and the next 3 days"),
         ("lookahead_days", "Countdown looks ahead (days)", "int", (1, 365), ""),
         ("offline_after_s", "Offline screen after (seconds of failure)", "int", (10, 3600), ""),
         ("clock_24h", "24-hour clock", "bool", None, ""),

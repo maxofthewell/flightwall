@@ -9,6 +9,7 @@
   "dad_name": "DADA",
   "leaving_soon_hours": 4,
   "landed_minutes": 90,
+  "home_banner_hours": 6,
   "lookahead_days": 90,
   "offline_after_s": 90,
   "temp_unit": "fahrenheit",
