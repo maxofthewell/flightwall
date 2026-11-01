@@ -66,7 +66,8 @@ DEFAULTS = {
     "airport_names": {},
     "place_names": {},
     "temp_unit": "fahrenheit",
-    "brightness": 60,
+    "brightness": 60,            # day: from the end of quiet hours until sunset
+    "evening_brightness": 35,    # from sunset (calculated for home) until quiet hours begin
     "night_brightness": 15,
     "night_start": "20:30",
     "night_end": "06:30",
@@ -1488,11 +1489,37 @@ def render(snap, now, t):
     return img
 
 
-def brightness_for(now):
-    local = now.astimezone(HOME_TZ).strftime("%H:%M")
+def sunset(day):
+    """Sunset at home on `day` (a date), as an aware UTC datetime. NOAA's approximation,
+    good to a minute or two; no network needed. None if the sun doesn't set (polar)."""
+    lat, lon = math.radians(CFG["home"]["lat"]), CFG["home"]["lon"]
+    g = 2 * math.pi / 365 * (day.timetuple().tm_yday - 1)
+    eqtime = 229.18 * (0.000075 + 0.001868 * math.cos(g) - 0.032077 * math.sin(g)
+                       - 0.014615 * math.cos(2 * g) - 0.040849 * math.sin(2 * g))
+    decl = (0.006918 - 0.399912 * math.cos(g) + 0.070257 * math.sin(g) - 0.006758 * math.cos(2 * g)
+            + 0.000907 * math.sin(2 * g) - 0.002697 * math.cos(3 * g) + 0.00148 * math.sin(3 * g))
+    x = (math.cos(math.radians(90.833)) / (math.cos(lat) * math.cos(decl))
+         - math.tan(lat) * math.tan(decl))
+    if not -1 <= x <= 1:
+        return None
+    minutes = 720 - 4 * (lon - math.degrees(math.acos(x))) - eqtime
+    return datetime(day.year, day.month, day.day, tzinfo=timezone.utc) + timedelta(minutes=minutes)
+
+
+def light_period(now):
+    """"day", "evening" (after sunset) or "quiet" (quiet hours), at home."""
+    local = now.astimezone(HOME_TZ)
+    hm = local.strftime("%H:%M")
     a, b = CFG["night_start"], CFG["night_end"]
-    night = (local >= a or local < b) if a > b else (a <= local < b)
-    return CFG["night_brightness"] if night else CFG["brightness"]
+    if (hm >= a or hm < b) if a > b else (a <= hm < b):
+        return "quiet"
+    ss = sunset(local.date())
+    return "evening" if ss and now >= ss else "day"
+
+
+def brightness_for(now):
+    return {"day": CFG["brightness"], "evening": CFG["evening_brightness"],
+            "quiet": CFG["night_brightness"]}[light_period(now)]
 
 
 # ----------------------------------------------------------------------------
@@ -1684,10 +1711,12 @@ SETTINGS = [
         ("home.tz", "Time zone", "tz", None, "e.g. America/Denver"),
     ]),
     ("Display", [
-        ("brightness", "Brightness", "int", (1, 100), ""),
-        ("night_brightness", "Night brightness", "int", (0, 100), "0 turns the panel off at night"),
-        ("night_start", "Night starts", "time", None, "HH:MM, home time"),
-        ("night_end", "Night ends", "time", None, "HH:MM, home time"),
+        ("brightness", "Day brightness", "int", (1, 100), "from the end of quiet hours until sunset"),
+        ("evening_brightness", "Evening brightness", "int", (0, 100),
+         "from sunset (worked out for your home location) until quiet hours begin"),
+        ("night_brightness", "Quiet hours brightness", "int", (0, 100), "0 turns the panel off"),
+        ("night_start", "Quiet hours begin", "time", None, "HH:MM, home time"),
+        ("night_end", "Quiet hours end", "time", None, "HH:MM, home time"),
         ("rotate", "Rotate", "choice", [(0, "0°"), (90, "90°"), (180, "180°"), (270, "270°")], "clockwise"),
         ("gpio_slowdown", "GPIO slowdown", "int", (0, 5), "raise if you see sparkle/ghosting"),
     ]),
@@ -1850,7 +1879,10 @@ def _status_rows():
     with LOCK:
         net, ha, cal_err = dict(STATE["net"]), dict(STATE["ha"]), STATE["cal_error"]
     loc, wx = snap["loc"], snap["wx"]
+    ss = sunset(now.astimezone(HOME_TZ).date())
     rows = [("Screen now", pick_mode(snap, now)[0].upper()),
+            ("Brightness", f"{light_period(now)}: {brightness_for(now)}"
+                           + (f" (sunset today {ss.astimezone(HOME_TZ):%I:%M %p})" if ss else "")),
             ("Location", f"{loc['city']} ({'home' if loc['at_home'] else 'away'})" if loc else "unknown"),
             ("Network", f"{net['status']}, Pi is {net.get('ip') or '?'}"),
             ("Home Assistant", ha["status"] + (f" - {ha['error']}" if ha.get("error") else "")),

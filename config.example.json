@@ -24,6 +24,7 @@
   "weather_every_s": 600,
 
   "brightness": 60,
+  "evening_brightness": 35,
   "night_brightness": 15,
   "night_start": "20:30",
   "night_end": "06:30",

@@ -134,8 +134,8 @@ To apply changes after editing, run `sudo systemctl restart flightwall`. To see 
 | `temp_unit` | `fahrenheit` | Or `celsius` |
 | `clock_24h` | `false` | `true` shows 17:30 instead of 5:30 PM |
 | `location_every_s` / `calendar_every_s` / `weather_every_s` | `60` / `300` / `600` | How often to poll HA location, the flight calendar, and weather |
-| `brightness` / `night_brightness` | `60` / `15` | 0–100 |
-| `night_start` / `night_end` | `20:30` / `06:30` | Dimming window, Denver time |
+| `brightness` / `evening_brightness` / `night_brightness` | `60` / `35` / `15` | 0–100. Day = end of quiet hours until sunset; evening = sunset (calculated for `home` lat/lon, no internet needed) until quiet hours begin; quiet hours = `night_start`–`night_end`. `0` turns the panel off. |
+| `night_start` / `night_end` | `20:30` / `06:30` | Quiet hours, Denver time |
 | `rotate` | `0` | `90` / `180` / `270`, clockwise, if the panel is mounted sideways or upside down |
 | `gpio_slowdown` | `4` | Lower (2–3) refreshes faster; raise it if you see sparkle or ghosting |
 | `web_password` | `""` | Password for the settings page. The page is off until you set this. |

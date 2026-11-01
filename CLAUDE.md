@@ -74,7 +74,7 @@ On the Pi, the app lives in `~/flightwall/` and the LED library in `~/rpi-rgb-le
 
 Screens 1–3 use the **cached calendar**, so they keep working through an HA outage. A **blinking orange 2×2 dot** in the top-right corner means a partial problem (internet down while HA is OK, a calendar error, or HA failing but still within the grace period).
 
-Other behavior: night dimming (brightness 60 → 15 from 20:30 to 06:30 Denver time; `night_brightness: 0` blanks the panel); 12-hour clock (`clock_24h` switches it); `rotate` turns the whole image for sideways/upside-down mounting; poll intervals are `location_every_s` / `calendar_every_s` / `weather_every_s`; all text is uppercase ASCII (`ascii_only`).
+Other behavior: three brightness periods (`light_period`): day `brightness` 60 from quiet-hours end to sunset, `evening_brightness` 35 from sunset (`sunset()`: NOAA approximation from `home` lat/lon, local, no network) to quiet hours, `night_brightness` 15 during quiet hours `night_start`–`night_end` (20:30–06:30 Denver); `0` blanks the panel; 12-hour clock (`clock_24h` switches it); `rotate` turns the whole image for sideways/upside-down mounting; poll intervals are `location_every_s` / `calendar_every_s` / `weather_every_s`; all text is uppercase ASCII (`ascii_only`).
 
 **Home screen** also shows today's high/low (`hi` / `lo` from Open-Meteo `daily`) on the bottom row (`draw_hilo`); the clock row moves up to baseline 46 when they're there. The whole home screen sits high (DADA baseline 15, IS HOME! 29, divider 33, HI/LO baseline 56) so rows 56–63 stay empty for the frame edge.
 
