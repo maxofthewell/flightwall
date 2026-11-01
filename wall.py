@@ -492,12 +492,14 @@ def fetch_weather(lat, lon):
 
 
 # ---- flights from the calendar ------------------------------------------------
-ROUTE = re.compile(r"\b([A-Z]{3})\s*(?:→|->|>|–|—|\bto\b)\s*([A-Z]{3})\b")
+ROUTE = re.compile(r"\b([A-Z]{3})\s*(?:→|⟶|->|>|–|—|\bto\b)\s*([A-Z]{3})\b")
 FLTNUM = re.compile(r"\b([A-Z]{2}|[A-Z]\d|\d[A-Z])\s?(\d{1,4})\b")
 
 
 def _clean(s):
-    return (s or "").replace("​", "").replace("⁠", "").replace(" ", " ")
+    """Drop invisible formatting characters (Flighty adds zero-width ones) and fix odd spaces."""
+    s = unicodedata.normalize("NFKC", s or "")  # also turns no-break spaces into plain ones
+    return "".join(c for c in s if unicodedata.category(c) != "Cf")
 
 
 def _dt(v):
@@ -512,9 +514,9 @@ def parse_flight(ev):
     if not start or not end or end <= start:
         return None
     summary = _clean(ev.get("summary"))
-    friend = bool(re.match(r"\s*friend\s*:", summary, re.I))  # Flighty: "Friend: ✈ MDW→DEN • WN 383"
+    friend = bool(re.match(r"[^a-z0-9]*friend\s*:", summary, re.I))  # Flighty: "Friend: ✈ SFO→DEN • UA 1230"
     if friend:
-        summary = re.sub(r"^\s*friend\s*:\s*", "", summary, flags=re.I)
+        summary = re.sub(r"^[^a-z0-9]*friend\s*:\s*", "", summary, flags=re.I)
     blob = " ".join(_clean(ev.get(k)) for k in ("summary", "location", "description"))
     m = ROUTE.search(summary) or ROUTE.search(blob)
     if not m and not CFG["all_events_are_flights"] and not re.search(r"\bflight\b", blob, re.I):
