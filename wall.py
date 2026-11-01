@@ -76,6 +76,8 @@ DEFAULTS = {
     "gpio_slowdown": 4,
     "web_password": "",
     "web_port": 8080,
+    "flightaware_key": "",       # AeroAPI key: live takeoff/landing times, delays, cancellations
+    "flightaware_enabled": True,
     # temporary visitor override (settings page): local airport times, "YYYY-MM-DDTHH:MM"
     "visitor": {"enabled": False, "name": "", "location": "", "flight": "",
                 "from": "", "to": "", "depart": "", "arrive": "",
@@ -683,6 +685,162 @@ def visitor_zones(origin, dest):
     return out
 
 
+# ---- FlightAware AeroAPI: live times and delays ------------------------------
+FA_URL = "https://aeroapi.flightaware.com/aeroapi"
+DELAY_SHOW_MIN = 15          # show "DELAYED" / "LATE" from this many minutes
+LIVE = {}                    # flight key -> latest AeroAPI info (guarded by LOCK)
+FA = {"status": "off", "error": "", "next_try": {}, "backoff_until": 0}
+
+
+def fa_on():
+    return bool(CFG["flightaware_enabled"] and CFG["flightaware_key"])
+
+
+def _iso(v):
+    try:
+        return datetime.fromisoformat(v.replace("Z", "+00:00")) if v else None
+    except (AttributeError, ValueError):
+        return None
+
+
+def fa_ident(f):
+    return re.sub(r"\s+", "", f.get("number") or "").upper()
+
+
+def fa_flight_key(f):
+    """Stable key for a booked flight: number + origin + scheduled departure (from the calendar)."""
+    return f"{fa_ident(f)}/{f.get('origin') or ''}/{f['start'].astimezone(timezone.utc):%Y%m%dT%H%M}"
+
+
+def fa_usage(add=0):
+    """AeroAPI calls this month (each call is billed), kept in .cache/fa_usage.json."""
+    path = os.path.join(CACHE, "fa_usage.json")
+    try:
+        with open(path) as fp:
+            use = json.load(fp)
+    except Exception:
+        use = {}
+    month = datetime.now(HOME_TZ).strftime("%Y-%m")
+    if add:
+        use[month] = use.get(month, 0) + add
+        os.makedirs(CACHE, exist_ok=True)
+        with open(path, "w") as fp:
+            json.dump(use, fp)
+    return use.get(month, 0)
+
+
+def fa_get(path, params=None):
+    r = requests.get(FA_URL + path, params=params, timeout=20,
+                     headers={"x-apikey": CFG["flightaware_key"], "Accept": "application/json"})
+    fa_usage(1)
+    r.raise_for_status()
+    return r.json()
+
+
+def fa_lookup(f):
+    """Live info for one booked flight, or None if FlightAware doesn't have it (yet).
+    Matches on origin/destination and the scheduled departure closest to the calendar's."""
+    ident = fa_ident(f)
+    if not ident:
+        return None
+    s = f["start"].astimezone(timezone.utc)
+    fmt = "%Y-%m-%dT%H:%M:%SZ"
+    data = fa_get(f"/flights/{ident}", {"start": (s - timedelta(hours=12)).strftime(fmt),
+                                         "end": (s + timedelta(hours=12)).strftime(fmt)})
+    code = lambda a: ((a or {}).get("code_iata") or "").upper()
+    best, best_gap = None, timedelta(hours=6)
+    for x in data.get("flights") or []:
+        if f.get("origin") and code(x.get("origin")) not in (f["origin"], ""):
+            continue
+        if f.get("dest") and code(x.get("destination")) not in (f["dest"], ""):
+            continue
+        sched = _iso(x.get("scheduled_out")) or _iso(x.get("scheduled_off"))
+        if sched and abs(sched - s) < best_gap:
+            best, best_gap = x, abs(sched - s)
+    if not best:
+        return None
+    first = lambda *keys: next((t for t in (_iso(best.get(k)) for k in keys) if t), None)
+    return {"start": first("actual_off", "estimated_off", "actual_out", "estimated_out",
+                           "scheduled_off", "scheduled_out"),
+            "end": first("actual_on", "estimated_on", "actual_in", "estimated_in",
+                         "scheduled_on", "scheduled_in"),
+            "dep_delay": best.get("departure_delay"), "arr_delay": best.get("arrival_delay"),
+            "cancelled": bool(best.get("cancelled")), "status": best.get("status") or "",
+            "ts": time.time()}
+
+
+def fa_interval(f, info, now):
+    """Seconds between lookups for this flight, or None if it shouldn't be looked up now:
+    from 24 h before departure, every 3 h until 6 h out, then every 15 min until it lands."""
+    dep = (info or {}).get("start") or f["start"]
+    arr = (info or {}).get("end") or f["end"]
+    if not fa_ident(f) or now < dep - timedelta(hours=24) or now > arr + timedelta(minutes=30):
+        return None
+    if (info or {}).get("cancelled"):
+        return 3 * 3600
+    return 3 * 3600 if dep - now > timedelta(hours=6) else 15 * 60
+
+
+def fa_poll(flights):
+    """Look up at most one due flight per call (the data thread calls this every 2 s)."""
+    if not fa_on():
+        FA["status"] = "off"
+        return
+    if time.time() < FA["backoff_until"]:
+        return
+    now = datetime.now(timezone.utc)
+    for f in flights:
+        key = fa_flight_key(f)
+        with LOCK:
+            info = LIVE.get(key)
+        every = fa_interval(f, info, now)
+        if every is None or time.time() < FA["next_try"].get(key, 0):
+            continue
+        FA["next_try"][key] = time.time() + every
+        try:
+            got = fa_lookup(f)
+            FA.update(status="ok", error="")
+            if got:
+                with LOCK:
+                    LIVE[key] = got
+                log(f"flightaware {fa_ident(f)}: {got['status'] or '?'}, "
+                    f"delay {round((got['arr_delay'] or got['dep_delay'] or 0) / 60)} min")
+        except requests.HTTPError as e:
+            code = e.response.status_code if e.response is not None else 0
+            FA.update(status="auth" if code in (401, 403) else "error", error=f"HTTP {code}")
+            if code in (401, 403, 429):
+                FA["backoff_until"] = time.time() + (3600 if code != 429 else 600)
+            log("flightaware error:", e)
+        except Exception as e:
+            FA.update(status="error", error=str(e)[:120])
+            log("flightaware error:", e)
+        return  # one call per pass
+
+
+def live(f):
+    """The flight with FlightAware's latest times, delays and cancellation applied (a copy)."""
+    with LOCK:
+        info = LIVE.get(fa_flight_key(f)) if fa_on() and fa_ident(f) else None  # f still has booked times
+    if not info:
+        return f
+    g = dict(f, live=True, cancelled=info["cancelled"], status=info["status"])
+    if info["start"] and info["end"] and info["end"] > info["start"]:
+        g.update(start=info["start"], end=info["end"])
+    g["dep_delay"] = info["dep_delay"] or 0
+    g["arr_delay"] = info["arr_delay"] or 0
+    return g
+
+
+def late_min(f, which):
+    """Minutes late ("dep" or "arr") if at least DELAY_SHOW_MIN, else 0."""
+    m = round((f.get(f"{which}_delay") or 0) / 60)
+    return m if m >= DELAY_SHOW_MIN else 0
+
+
+def late_text(m):
+    return f"{m // 60}H {m % 60:02d}M" if m >= 60 else f"{m}M"
+
+
 # ---- background updater ------------------------------------------------------
 STATE = {"visitor": {"q": None, "loc": None, "wx": None}, "loc": None, "wx": None, "home_wx": None, "flights": [],
          "net": {"status": "unknown", "ip": None, "fail_since": None},
@@ -734,12 +892,21 @@ def visitor_plan(now=None):
         end = datetime.fromisoformat(v["arrive"]).replace(tzinfo=ZoneInfo(v.get("arrive_tz") or CFG["home"]["tz"]))
     except (KeyError, TypeError, ValueError):
         return None
-    if end <= start or (now and now >= end + timedelta(minutes=CFG["landed_minutes"])):
+    if end <= start:
         return None
     origin, dest = (v.get("from") or "").upper() or None, (v.get("to") or "").upper() or None
-    return {"start": start, "end": end, "origin": origin, "dest": dest,
-            "number": (v.get("flight") or "").upper(), "home": dest in CFG["home"]["airports"],
-            "summary": "", "name": ascii_only(v.get("name") or "").upper() or "GUEST", "visitor": True}
+    f = live({"start": start, "end": end, "origin": origin, "dest": dest,
+              "number": (v.get("flight") or "").upper(), "home": dest in CFG["home"]["airports"],
+              "summary": "", "name": ascii_only(v.get("name") or "").upper() or "GUEST", "visitor": True})
+    if now and now >= f["end"] + timedelta(minutes=CFG["landed_minutes"]):
+        return None
+    return f
+
+
+def _visitor_booked_start(f):
+    """The visitor's typed departure (the FlightAware key uses booked times, not live ones)."""
+    v = CFG["visitor"]
+    return datetime.fromisoformat(v["depart"]).replace(tzinfo=ZoneInfo(v.get("depart_tz") or CFG["home"]["tz"]))
 
 
 def visitor_query():
@@ -847,6 +1014,12 @@ def data_loop():
                 except Exception as e:
                     log("visitor update error:", e)
                     due["vis"] = now + 120
+        with LOCK:
+            booked = list(STATE["flights"])
+        vf = visitor_plan()
+        if vf:
+            vf = dict(vf, start=_visitor_booked_start(vf))
+        fa_poll(booked + ([vf] if vf else []))
         if now >= due["hwx"]:  # Denver weather, for the offline screen
             try:
                 hw = fetch_weather(CFG["home"]["lat"], CFG["home"]["lon"])
@@ -863,10 +1036,11 @@ def data_loop():
 # ----------------------------------------------------------------------------
 def pick_mode(snap, now):
     flights = snap["flights"]
-    for f in flights:
+    flown = [f for f in flights if not f.get("cancelled")]
+    for f in flown:
         if f["start"] <= now < f["end"]:
             return "flying", f
-    recent = [f for f in flights if f["home"] and
+    recent = [f for f in flown if f["home"] and
               f["end"] <= now < f["end"] + timedelta(minutes=CFG["landed_minutes"])]
     if recent:
         return "landed", recent[-1]
@@ -877,16 +1051,16 @@ def pick_mode(snap, now):
     v = snap.get("visitor")  # temporary override from the settings page
     if v:
         f = v["flight"]
-        if f["start"] <= now < f["end"]:
+        if not f.get("cancelled") and f["start"] <= now < f["end"]:
             return "flying", f
-        if f["end"] <= now < f["end"] + timedelta(minutes=CFG["landed_minutes"]):
+        if not f.get("cancelled") and f["end"] <= now < f["end"] + timedelta(minutes=CFG["landed_minutes"]):
             return "landed", f
         if now < f["start"]:
             return "visitor", v
     if snap.get("offline"):
         return "offline", snap["offline"]
     if snap["loc"] and snap["loc"]["at_home"]:
-        landed = [f["end"] for f in flights if f["home"] and f["end"] <= now]
+        landed = [f["end"] for f in flown if f["home"] and f["end"] <= now]
         if landed and now - max(landed) < timedelta(hours=CFG["home_banner_hours"]):
             return "home", None  # "DADA IS HOME!" for a while after he lands
         return "home_weather", None
@@ -921,7 +1095,7 @@ def degraded(net, ha, cal_error):
 
 def next_home_flight(snap, now):
     for f in snap["flights"]:
-        if f["home"] and f["start"] > now:
+        if f["home"] and f["start"] > now and not f.get("cancelled"):
             return f
     return None
 
@@ -1163,11 +1337,15 @@ def screen_flying(img, d, snap, now, t, f):
         msg = "ON THE WAY!" if f.get("visitor") else "COMING HOME!"
         rainbow(d, (W - small.width(msg)) // 2, 55, msg, small, t)
         hm, ap = clock(f["end"].astimezone(HOME_TZ))
-        ctext(d, 63, f"LANDS {hm} {ap}".strip(), tiny, GREY)
+        label, color = f"LANDS {hm} {ap}".strip(), GREY
     else:
         fit_text(img, d, 1, W - 1, 55, [("TO ", GREY), (dest_name(f), CYAN)], t, center=True)
-        if f["number"]:
-            ctext(d, 63, f["number"], tiny, GREY)
+        label, color = f["number"], GREY
+    late = late_min(f, "arr")
+    if late and int(t / 2) % 2:  # alternate with how late it is every 2 s
+        label, color = f"LATE {late_text(late)}", ORANGE
+    if label:
+        ctext(d, 63, label, fit_font(label, W - 2, ("4x6", "tom-thumb")), color)
 
 
 def screen_leaving(img, d, snap, now, t, f):
@@ -1183,13 +1361,19 @@ def screen_leaving(img, d, snap, now, t, f):
         fit_text(img, d, 1, W - 1, 32, [("TO ", GREY), (dest_name(f), CYAN)], t, center=True)
     d.line((6, 36, W - 7, 36), fill=DIM)
 
+    if f.get("cancelled"):
+        ctext(d, 52, "CANCELLED", fit_font("CANCELLED", W - 2, ("7x13B", "6x10", "5x7")), RED)
+        return
     mins = max(0, math.ceil((f["start"] - now).total_seconds() / 60))
     left = f"{mins // 60}H {mins % 60:02d}M" if mins >= 60 else f"{mins} MIN"
     big = font("9x15B") if font("9x15B").width(left) <= W - 2 else font("7x13B")
     ctext(d, 52, left, big, YELLOW)
     hm, ap = clock(f["start"].astimezone(HOME_TZ))
-    label = f"TAKEOFF {hm} {ap}".strip()
-    ctext(d, 62, label, fit_font(label, W - 2, ("4x6", "tom-thumb")), GREY)
+    late = late_min(f, "dep")
+    label, color = f"TAKEOFF {hm} {ap}".strip(), GREY
+    if late and int(t / 2) % 2:  # alternate with the delay every 2 s
+        label, color = f"DELAYED {late_text(late)}", ORANGE
+    ctext(d, 62, label, fit_font(label, W - 2, ("4x6", "tom-thumb")), color)
 
 
 def screen_landed(img, d, snap, now, t, f):
@@ -1344,6 +1528,15 @@ def demo_scenarios():
                            "flights": [], "degraded": True}, now),
         ("leaving_soon", {"loc": loc("Denver", "us-co", True), "wx": None,
                           "flights": [fl("DEN", "LHR", 2.75, 9.5, "BA 218")]}, now),
+        ("leaving_delayed", {"loc": loc("Denver", "us-co", True), "wx": None,
+                             "flights": [dict(fl("DEN", "LHR", 2.75, 9.5, "BA 218"), live=True, dep_delay=50 * 60)]},
+         now),
+        ("leaving_cancelled", {"loc": loc("Denver", "us-co", True), "wx": None,
+                               "flights": [dict(fl("DEN", "SFO", 1.5, 2.4, "UA 552"), live=True, cancelled=True)]},
+         now),
+        ("flying_home_late", {"loc": loc("Chicago", "us-il"), "wx": None,
+                              "flights": [dict(fl("ORD", "DEN", -1.6, 2.6, "UA 2211"), live=True,
+                                               arr_delay=35 * 60)]}, now),
         ("leaving_home_from_mdw", {"loc": loc("Denver", "us-co", True), "wx": None,
                                    "flights": [fl("MDW", "DEN", 1.5, 2.7, "WN 383")]}, now),
         ("leaving_soon_40min", {"loc": loc("Denver", "us-co", True), "wx": None,
@@ -1461,6 +1654,11 @@ SETTINGS = [
         ("visitor.to", "To airport", "iata", None, "e.g. DEN"),
         ("visitor.depart", "Departs", "datetime", None, "local time at the departure airport, as on the ticket"),
         ("visitor.arrive", "Lands", "datetime", None, "local time at the arrival airport, as on the ticket"),
+    ]),
+    ("Flight data (FlightAware)", [
+        ("flightaware_enabled", "Use FlightAware live times", "bool", None,
+         "real takeoff/landing times, delays and cancellations for flights with a flight number"),
+        ("flightaware_key", "AeroAPI key", "secret", None, "leave blank to keep"),
     ]),
     ("Polling", [
         ("location_every_s", "Location every (s)", "int", (10, 3600), ""),
@@ -1589,6 +1787,15 @@ def restart_self():
     os.execv(sys.executable, [sys.executable] + sys.argv)
 
 
+def _live_text(f):
+    if not f.get("live"):
+        return ""
+    if f.get("cancelled"):
+        return "  - CANCELLED"
+    late = late_min(f, "arr") or late_min(f, "dep")
+    return f"  - {f.get('status') or 'tracked'}" + (f", {late} min late" if late else "")
+
+
 def _status_rows():
     snap, now = LAST["snap"], datetime.now(timezone.utc)
     if not snap:
@@ -1621,11 +1828,14 @@ def _status_rows():
         rows.append(("Visitor", f"{f['name']}: {state}"))
     elif CFG["visitor"].get("enabled"):
         rows.append(("Visitor", "finished - you can switch it off"))
+    if fa_on():
+        rows.append(("FlightAware", f"{FA['status']}{' - ' + FA['error'] if FA['error'] else ''}; "
+                                    f"{fa_usage()} calls this month"))
     upcoming = [f for f in snap["flights"] if f["end"] > now][:3]
     for f in upcoming:
         rows.append(("Flight", f"{f['start'].astimezone(HOME_TZ):%a %b %d %I:%M %p}  "
                                f"{f['origin'] or '?'} → {f['dest'] or '?'}  {f['number']}"
-                               f"{'  (home)' if f['home'] else ''}"))
+                               f"{'  (home)' if f['home'] else ''}{_live_text(f)}"))
     if not upcoming:
         rows.append(("Flights", "none booked"))
     return rows
@@ -1932,11 +2142,39 @@ def diagnose():
     print("\nSCREEN NOW:", pick_mode({"loc": loc, "flights": fl, "wx": None}, now)[0].upper(), "\n")
 
 
+def fa_test(ident):
+    """--fa UA616: one AeroAPI call (yesterday to +2 days) printing what wall.py reads from it."""
+    if not CFG["flightaware_key"]:
+        sys.exit("set flightaware_key first (settings page or config.json)")
+    now = datetime.now(timezone.utc)
+    fmt = "%Y-%m-%dT%H:%M:%SZ"
+    try:
+        data = fa_get(f"/flights/{re.sub(r'[^A-Za-z0-9]', '', ident).upper()}",
+                      {"start": (now - timedelta(days=1)).strftime(fmt),
+                       "end": (now + timedelta(days=2)).strftime(fmt)})
+    except requests.HTTPError as e:
+        body = e.response.text[:300] if e.response is not None else ""
+        sys.exit(f"FlightAware said {e} {body}")
+    fl = data.get("flights") or []
+    print(f"{len(fl)} flight(s); top-level keys: {sorted(data)}")
+    for x in fl:
+        o, de = x.get("origin") or {}, x.get("destination") or {}
+        print(f"\n  {x.get('ident_iata') or x.get('ident')}  {o.get('code_iata')} -> {de.get('code_iata')}  "
+              f"status={x.get('status')!r} cancelled={x.get('cancelled')}")
+        for k in ("out", "off", "on", "in"):
+            print(f"    {k:>3}: sched {x.get('scheduled_' + k)}  est {x.get('estimated_' + k)}  act {x.get('actual_' + k)}")
+        print(f"    delays (s): dep {x.get('departure_delay')}  arr {x.get('arrival_delay')}")
+    if fl:
+        print(f"\n  all fields: {sorted(fl[0])}")
+    print(f"\nAeroAPI calls this month (counted here): {fa_usage()}")
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--demo", action="store_true", help="cycle all screens with fake data")
     ap.add_argument("--check", action="store_true", help="print Home Assistant data and exit")
     ap.add_argument("--png", metavar="DIR", help="render demo screens to PNGs and exit")
+    ap.add_argument("--fa", metavar="FLIGHT", help="look a flight up on FlightAware (e.g. UA616) and exit")
     args = ap.parse_args()
 
     if args.png:
@@ -1946,6 +2184,10 @@ def main():
                 img = render(snap, now, tt)
                 led_preview(img).save(os.path.join(args.png, f"{name}{'' if tt == 0 else '_b'}.png"))
         print("wrote", args.png)
+        return
+
+    if args.fa:
+        fa_test(args.fa)
         return
 
     if args.check:
@@ -1975,6 +2217,7 @@ def main():
                     "flights": list(STATE["flights"]),
                     "offline": offline_reason(net, ha, cal_err, time.time()),
                     "degraded": degraded(net, ha, cal_err)}
+        snap["flights"] = [live(f) for f in snap["flights"]]  # FlightAware times, if any
         snap["visitor"] = visitor_snapshot(now)
         try:
             img = render(snap, now, time.time() - t0)

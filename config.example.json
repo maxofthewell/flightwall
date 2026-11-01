@@ -31,6 +31,9 @@
   "web_password": "",
   "web_port": 8080,
 
+  "flightaware_key": "",
+  "flightaware_enabled": true,
+
   "visitor": {"enabled": false, "name": "", "location": "", "flight": "",
               "from": "", "to": "", "depart": "", "arrive": "",
               "depart_tz": "", "arrive_tz": ""},

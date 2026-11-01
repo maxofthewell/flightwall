@@ -139,6 +139,8 @@ To apply changes after editing, run `sudo systemctl restart flightwall`. To see 
 | `web_password` | `""` | Password for the settings page. The page is off until you set this. |
 | `web_port` | `8080` | Port for the settings page |
 | `visitor` | off | Temporary visitor screen; easiest to set on the settings page (see below) |
+| `flightaware_key` | `""` | FlightAware AeroAPI key (settings page → Flight data). Never shown on the page. |
+| `flightaware_enabled` | `true` | Use FlightAware live times when a key is set |
 | `font_dir` | `/home/mk/rpi-rgb-led-matrix/fonts` | BDF fonts from the LED library |
 | `all_events_are_flights` | `false` | Treat every calendar event as a flight |
 
@@ -161,6 +163,12 @@ For Grandma's trip, say. In the settings page's **Visitor** section, tick **Show
 
 Dada's own flights always come first: if one of his flights is about to leave, in the air, or just landed, that screen shows instead.
 
+## Live flight times (FlightAware)
+
+With an AeroAPI key (settings page → **Flight data (FlightAware)**), every flight that has a flight number (Flighty's calendar flights and the visitor's) is looked up on FlightAware from 24 hours before departure until it lands: every 3 hours until 6 hours out, then every 15 minutes. Its real or estimated takeoff and landing times replace the booked ones, so the "flies soon", flying, landed and countdown screens follow delays. A delay of 15 minutes or more shows as **DELAYED 25M** (alternating with the takeoff time) and **LATE 35M** (alternating with the landing time); a cancelled flight shows **CANCELLED** and never switches to the flying screen. Without a key, or if FlightAware has no match, the booked times are used as before.
+
+Expect roughly 30–40 calls per flight. The settings page shows FlightAware's status and the calls counted this month. To test the key on the Pi: `python3 wall.py --fa UA616` (one call; prints what FlightAware returns for that flight from yesterday to 2 days ahead).
+
 ## Commands
 
 | Command | What it does |
@@ -169,6 +177,7 @@ Dada's own flights always come first: if one of his flights is about to leave, i
 | `python3 wall.py --check` | Tests network → HA → token → entities → flights → weather, and prints a fix for anything that fails. Lists your HA's person and calendar entities if the configured ones aren't found. |
 | `sudo python3 wall.py --demo` | Cycles every screen with made-up data, 8 s each. Stop the service first. |
 | `python3 wall.py --png DIR` | Renders the demo screens to PNG files, no panel needed |
+| `python3 wall.py --fa UA616` | One FlightAware lookup, printing the fields the display uses (needs `flightaware_key`) |
 
 ## Troubleshooting
 
