@@ -122,6 +122,8 @@ To apply changes after editing, run `sudo systemctl restart flightwall`. To see 
 | `flight_calendar` | `calendar.flighty` | Calendar with the flights |
 | `home` | Denver | `lat`, `lon`, `radius_km` (counts as home), `airports` (flights to these are "home"), `tz` |
 | `dad_name` | `DADA` | Name shown on screen |
+| `friend_flights` | `true` | Show friends' flights: calendar events whose title starts with "Friend:" and that leave or land at a home airport. Same timing as Dada's (flies soon, flying, landed into Denver); Dada's own flights always come first. |
+| `friend_name` | `VISITOR` | What the screen calls a friend ("VISITOR IS FLYING", "VISITOR LANDED!") |
 | `leaving_soon_hours` | `4` | Hours before any booked flight that the "flies soon" screen starts (decimals OK, e.g. `2.5`; up to 168) |
 | `landed_minutes` | `90` | Minutes after landing in Denver that the "landed" screen stays up |
 | `home_banner_hours` | `6` | Hours after landing in Denver that "DADA IS HOME!" stays up (after the landed screen). After that, or if he got home without a flight, the home screen shows the clock, weather, high/low and a 3-day forecast. `0` = never show the banner. |

@@ -56,6 +56,8 @@ DEFAULTS = {
     "home": {"lat": 39.7392, "lon": -104.9903, "radius_km": 40,
              "airports": ["DEN"], "city_word": "denver", "tz": "America/Denver"},
     "dad_name": "DADA",
+    "friend_flights": True,      # calendar events titled "Friend: ..." to/from a home airport
+    "friend_name": "VISITOR",    # what the screen calls them
     "landed_minutes": 90,
     "home_banner_hours": 6,
     "lookahead_days": 90,
@@ -509,6 +511,9 @@ def parse_flight(ev):
     if not start or not end or end <= start:
         return None
     summary = _clean(ev.get("summary"))
+    friend = bool(re.match(r"\s*friend\s*:", summary, re.I))  # Flighty: "Friend: ✈ MDW→DEN • WN 383"
+    if friend:
+        summary = re.sub(r"^\s*friend\s*:\s*", "", summary, flags=re.I)
     blob = " ".join(_clean(ev.get(k)) for k in ("summary", "location", "description"))
     m = ROUTE.search(summary) or ROUTE.search(blob)
     if not m and not CFG["all_events_are_flights"] and not re.search(r"\bflight\b", blob, re.I):
@@ -518,9 +523,19 @@ def parse_flight(ev):
     n = FLTNUM.search(rest)
     home = (dest in CFG["home"]["airports"]) if dest else \
         bool(re.search(r"\bto\s+" + CFG["home"]["city_word"], blob, re.I))
-    return {"start": start, "end": end, "origin": origin, "dest": dest,
-            "number": f"{n.group(1)} {n.group(2)}" if n else "",
-            "home": home, "summary": summary}
+    f = {"start": start, "end": end, "origin": origin, "dest": dest,
+         "number": f"{n.group(1)} {n.group(2)}" if n else "",
+         "home": home, "summary": summary}
+    if friend:
+        f.update(friend=True, name=ascii_only(CFG["friend_name"] or "VISITOR").upper())
+    return f
+
+
+def keep_flight(f):
+    """Dada's flights always; friends' only if switched on and they leave or land at home."""
+    if not f.get("friend"):
+        return True
+    return bool(CFG["friend_flights"] and (f["home"] or f["origin"] in CFG["home"]["airports"]))
 
 
 def fetch_flights():
@@ -529,7 +544,7 @@ def fetch_flights():
     events = ha_get(f"/api/calendars/{CFG['flight_calendar']}", {
         "start": (now - timedelta(days=2)).strftime(fmt),
         "end": (now + timedelta(days=CFG["lookahead_days"])).strftime(fmt)})
-    flights = [f for f in (parse_flight(e) for e in events) if f]
+    flights = [f for f in (parse_flight(e) for e in events) if f and keep_flight(f)]
     return sorted(flights, key=lambda f: f["start"])
 
 
@@ -1034,8 +1049,8 @@ def data_loop():
 # ----------------------------------------------------------------------------
 # Deciding what to show
 # ----------------------------------------------------------------------------
-def pick_mode(snap, now):
-    flights = snap["flights"]
+def flight_mode(flights, now):
+    """flying / landed / leaving for one group of booked flights, or None."""
     flown = [f for f in flights if not f.get("cancelled")]
     for f in flown:
         if f["start"] <= now < f["end"]:
@@ -1048,6 +1063,17 @@ def pick_mode(snap, now):
     for f in flights:  # any booked flight, wherever it leaves from and wherever GPS says he is
         if now < f["start"] <= now + soon:
             return "leaving", f
+    return None
+
+
+def pick_mode(snap, now):
+    flights = [f for f in snap["flights"] if not f.get("friend")]  # Dada's own
+    friends = [f for f in snap["flights"] if f.get("friend")] if CFG["friend_flights"] else []
+    flown = [f for f in flights if not f.get("cancelled")]
+    for group in (flights, friends):  # Dada's flights always beat friends'
+        hit = flight_mode(group, now)
+        if hit:
+            return hit
     v = snap.get("visitor")  # temporary override from the settings page
     if v:
         f = v["flight"]
@@ -1095,7 +1121,7 @@ def degraded(net, ha, cal_error):
 
 def next_home_flight(snap, now):
     for f in snap["flights"]:
-        if f["home"] and f["start"] > now and not f.get("cancelled"):
+        if f["home"] and f["start"] > now and not f.get("cancelled") and not f.get("friend"):
             return f
     return None
 
@@ -1308,13 +1334,23 @@ def draw_hilo(img, d, base, wx):
         x += gap
 
 
+def draw_title(d, base, options, t):
+    """Rainbow title line: the first of `options` that fits in 4x6, then tom-thumb."""
+    for msg in options:
+        for name in ("4x6", "tom-thumb"):
+            if font(name).width(msg) <= W:
+                rainbow(d, (W - font(name).width(msg)) // 2, base, msg, font(name), t)
+                return
+    msg = options[-1]
+    rainbow(d, 0, base, msg, font("tom-thumb"), t)
+
+
 def screen_flying(img, d, snap, now, t, f):
     total = (f["end"] - f["start"]).total_seconds()
     p = max(0.0, min(1.0, (now - f["start"]).total_seconds() / total))
     small, tiny = font("5x7"), font("4x6")
-    msg = (f.get("name") or CFG["dad_name"]) + " IS FLYING"
-    tf = fit_font(msg, W, ("4x6", "tom-thumb"))
-    rainbow(d, (W - tf.width(msg)) // 2, 6, msg, tf, t)
+    who = f.get("name") or CFG["dad_name"]
+    draw_title(d, 6, (who + " IS FLYING", who + " FLYING"), t)
 
     draw_route(img, d, f, CYAN)
 
@@ -1334,7 +1370,7 @@ def screen_flying(img, d, snap, now, t, f):
           small, WHITE)
     d.line((6, 46, W - 7, 46), fill=DIM)
     if f["home"]:
-        msg = "ON THE WAY!" if f.get("visitor") else "COMING HOME!"
+        msg = "ON THE WAY!" if f.get("visitor") or f.get("friend") else "COMING HOME!"
         rainbow(d, (W - small.width(msg)) // 2, 55, msg, small, t)
         hm, ap = clock(f["end"].astimezone(HOME_TZ))
         label, color = f"LANDS {hm} {ap}".strip(), GREY
@@ -1350,12 +1386,11 @@ def screen_flying(img, d, snap, now, t, f):
 
 def screen_leaving(img, d, snap, now, t, f):
     """A booked flight takes off within `leaving_soon_hours`."""
-    msg = (f.get("name") or CFG["dad_name"]) + " FLIES SOON"
-    tf = fit_font(msg, W, ("4x6", "tom-thumb"))
-    rainbow(d, (W - tf.width(msg)) // 2, 6, msg, tf, t)
+    who = f.get("name") or CFG["dad_name"]
+    draw_title(d, 6, (who + " FLIES SOON", who + " FLIES"), t)
     draw_route(img, d, f, GREY)
     if f["home"]:
-        msg = "COMING HOME!"
+        msg = "ON THE WAY!" if f.get("friend") else "COMING HOME!"
         rainbow(d, (W - font("5x7").width(msg)) // 2, 32, msg, font("5x7"), t)
     else:
         fit_text(img, d, 1, W - 1, 32, [("TO ", GREY), (dest_name(f), CYAN)], t, center=True)
@@ -1537,6 +1572,15 @@ def demo_scenarios():
         ("flying_home_late", {"loc": loc("Chicago", "us-il"), "wx": None,
                               "flights": [dict(fl("ORD", "DEN", -1.6, 2.6, "UA 2211"), live=True,
                                                arr_delay=35 * 60)]}, now),
+        ("friend_flies_soon", {"loc": loc("Denver", "us-co", True), "wx": None,
+                               "flights": [dict(fl("DEN", "SEA", 1.25, 2.8, "AS 609"), friend=True, name="VISITOR")]}, now),
+        ("friend_flying_in", {"loc": loc("Denver", "us-co", True), "wx": None,
+                              "flights": [dict(fl("BOS", "DEN", -2.0, 4.5, "UA 351"), friend=True, name="VISITOR")]}, now),
+        ("friend_landed", {"loc": loc("Denver", "us-co", True), "wx": None,
+                           "flights": [dict(fl("BOS", "DEN", -5.0, 4.5, "UA 351"), friend=True, name="VISITOR")]}, now),
+        ("dada_beats_friend", {"loc": loc("Chicago", "us-il"), "wx": None,  # both in the air: Dada's wins
+                               "flights": [dict(fl("BOS", "DEN", -2.0, 4.5, "UA 351"), friend=True, name="VISITOR"),
+                                           fl("ORD", "DEN", -1.6, 2.6, "UA 2211")]}, now),
         ("leaving_home_from_mdw", {"loc": loc("Denver", "us-co", True), "wx": None,
                                    "flights": [fl("MDW", "DEN", 1.5, 2.7, "WN 383")]}, now),
         ("leaving_soon_40min", {"loc": loc("Denver", "us-co", True), "wx": None,
@@ -1616,6 +1660,9 @@ SETTINGS = [
     ]),
     ("Screens", [
         ("dad_name", "Name on screen", "text", None, ""),
+        ("friend_flights", "Show friends' flights", "bool", None,
+         'calendar events starting "Friend:" that leave or land at a home airport; yours always come first'),
+        ("friend_name", "Friends are called", "text", None, "e.g. VISITOR"),
         ("leaving_soon_hours", '"Flies soon" starts (hours before takeoff)', "float", (0, 168), "any flight, from anywhere"),
         ("landed_minutes", '"Landed" stays up (minutes after landing)', "int", (0, 1440), ""),
         ("home_banner_hours", '"Is home!" stays up (hours after landing)', "float", (0, 48),
@@ -1835,7 +1882,8 @@ def _status_rows():
     for f in upcoming:
         rows.append(("Flight", f"{f['start'].astimezone(HOME_TZ):%a %b %d %I:%M %p}  "
                                f"{f['origin'] or '?'} → {f['dest'] or '?'}  {f['number']}"
-                               f"{'  (home)' if f['home'] else ''}{_live_text(f)}"))
+                               f"{'  (home)' if f['home'] else ''}{'  (friend)' if f.get('friend') else ''}"
+                               f"{_live_text(f)}"))
     if not upcoming:
         rows.append(("Flights", "none booked"))
     return rows
@@ -2114,7 +2162,7 @@ def diagnose():
             print(f"      {f['start'].astimezone(HOME_TZ):%a %b %d %I:%M%p} -> "
                   f"{f['end'].astimezone(HOME_TZ):%I:%M%p}  {f['origin']}->{f['dest']} "
                   f"({airport_city(f['dest']) or '?'}) "
-                  f"{f['number']:8} home={f['home']}  [{f['summary']}]")
+                  f"{f['number']:8} home={f['home']}{' FRIEND' if f.get('friend') else ''}  [{f['summary']}]")
     except Exception as e:
         bad(f"couldn't read flights: {str(e)[:100]}")
 

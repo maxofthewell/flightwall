@@ -7,6 +7,8 @@
 
   "home": {"lat": 39.7392, "lon": -104.9903, "radius_km": 40, "airports": ["DEN"]},
   "dad_name": "DADA",
+  "friend_flights": true,
+  "friend_name": "VISITOR",
   "leaving_soon_hours": 4,
   "landed_minutes": 90,
   "home_banner_hours": 6,
