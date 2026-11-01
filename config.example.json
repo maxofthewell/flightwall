@@ -36,6 +36,7 @@
 
   "flightaware_key": "",
   "flightaware_enabled": true,
+  "flightaware_max_calls": 1600,
 
   "visitor": {"enabled": false, "name": "", "location": "", "flight": "",
               "from": "", "to": "", "depart": "", "arrive": "",

@@ -81,6 +81,7 @@ DEFAULTS = {
     "web_port": 8080,
     "flightaware_key": "",       # AeroAPI key: live takeoff/landing times, delays, cancellations
     "flightaware_enabled": True,
+    "flightaware_max_calls": 1600,  # per month; each call costs $0.005, so 1600 = $8
     # temporary visitor override (settings page): local airport times, "YYYY-MM-DDTHH:MM"
     "visitor": {"enabled": False, "name": "", "location": "", "flight": "",
                 "from": "", "to": "", "depart": "", "arrive": "",
@@ -804,7 +805,14 @@ def fa_poll(flights):
     if not fa_on():
         FA["status"] = "off"
         return
+    if FA["status"] == "off":
+        FA["status"] = "idle"  # key set; nothing looked up yet (no flight within 24 h)
     if time.time() < FA["backoff_until"]:
+        return
+    if fa_usage() >= CFG["flightaware_max_calls"]:
+        if FA["status"] != "limit":
+            log(f"flightaware: monthly limit of {CFG['flightaware_max_calls']} calls reached; using calendar times")
+        FA.update(status="limit", error=f"{CFG['flightaware_max_calls']} calls this month")
         return
     now = datetime.now(timezone.utc)
     for f in flights:
@@ -1737,6 +1745,8 @@ SETTINGS = [
         ("flightaware_enabled", "Use FlightAware live times", "bool", None,
          "real takeoff/landing times, delays and cancellations for flights with a flight number"),
         ("flightaware_key", "AeroAPI key", "secret", None, "leave blank to keep"),
+        ("flightaware_max_calls", "Monthly call limit", "int", (0, 100000),
+         "each call costs $0.005 ($10 = 2000 calls); lookups stop at this many until next month"),
     ]),
     ("Polling", [
         ("location_every_s", "Location every (s)", "int", (10, 3600), ""),
@@ -1953,10 +1963,16 @@ def settings_page(msg="", errors=(), form=None):
     if msg:
         out.append(f"<div class='msg ok'>{e(msg)}</div>")
     if errors:
-        out.append("<div class='msg err'>Not saved:<br>" + "<br>".join(e(x) for x in errors) + "</div>")
+        title = "" if form is None and len(errors) == 1 else "Not saved:<br>"
+        out.append(f"<div class='msg err'>{title}" + "<br>".join(e(x) for x in errors) + "</div>")
     out.append("<section><h2>Live</h2><img class=preview id=pv src='panel.png' alt='panel preview'>"
                "<table>" + "".join(f"<tr><td>{e(k)}</td><td>{e(v)}</td></tr>" for k, v in _status_rows())
-               + "</table></section>")
+               + "</table>"
+               + (f"<form method=post action='fa-test' style='margin-top:10px'>"
+                  f"<input type=hidden name=csrf value='{CSRF}'>"
+                  "<button class=alt>Test FlightAware (uses 1 call)</button></form>"
+                  if CFG["flightaware_key"] else "")
+               + "</section>")
     out.append(f"<form method=post action='save'><input type=hidden name=csrf value='{CSRF}'>")
     for group, fields in SETTINGS:
         out.append(f"<section><h2>{e(group)}</h2>")
@@ -2050,6 +2066,10 @@ class SettingsHandler(BaseHTTPRequestHandler):
         if not hmac.compare_digest(form.get("csrf", [""])[0], CSRF):
             return self._send("Stale page - reload and try again.", "text/plain", 403)
         path = urlparse(self.path).path
+        if path == "/fa-test":
+            ok, msg = fa_check()
+            log("flightaware test:", msg)
+            return self._send(settings_page(msg) if ok else settings_page(errors=[msg]))
         if path == "/restart":
             self._send(settings_page("Restarting... reload this page in about 10 seconds."))
             threading.Timer(1, restart_self).start()
@@ -2222,6 +2242,44 @@ def diagnose():
               f"= {vf['start'].astimezone(HOME_TZ):%a %I:%M %p} -> {vf['end'].astimezone(HOME_TZ):%a %I:%M %p} "
               f"{vf['end'].astimezone(HOME_TZ).tzname()} (waiting in {visitor_query()})")
     print("\nSCREEN NOW:", pick_mode({"loc": loc, "flights": fl, "wx": None}, now)[0].upper(), "\n")
+
+
+def fa_check():
+    """One lookup for the settings page's Test button: (ok, message). Uses the next booked
+    flight with a flight number (so the answer means something), else United 1."""
+    if not CFG["flightaware_key"]:
+        return False, "No AeroAPI key saved yet."
+    if fa_usage() >= CFG["flightaware_max_calls"]:
+        return False, f"Monthly limit reached ({fa_usage()} calls) - raise it to test."
+    now = datetime.now(timezone.utc)
+    snap = LAST["snap"] or {}
+    booked = [f for f in snap.get("flights", []) if fa_ident(f) and f["end"] > now]
+    v = (snap.get("visitor") or {}).get("flight")
+    if v and fa_ident(v):
+        booked.append(v)
+    ident = fa_ident(min(booked, key=lambda f: f["start"])) if booked else "UA1"
+    fmt = "%Y-%m-%dT%H:%M:%SZ"
+    try:
+        data = fa_get(f"/flights/{ident}", {"start": (now - timedelta(days=1)).strftime(fmt),
+                                            "end": (now + timedelta(days=2)).strftime(fmt)})
+    except requests.HTTPError as e:
+        code = e.response.status_code if e.response is not None else 0
+        if code in (401, 403):
+            return False, f"FlightAware rejected the key (HTTP {code}). Check it in the AeroAPI portal."
+        return False, f"FlightAware error (HTTP {code})."
+    except Exception as e:
+        return False, f"Couldn't reach FlightAware: {str(e)[:100]}"
+    FA.update(status="ok", error="", backoff_until=0)
+    fl = data.get("flights") or []
+    if not fl:
+        return True, (f"Key works. FlightAware has no {ident} flights between yesterday and 2 days "
+                      f"from now (lookups only start 24 h before a flight). {fa_usage()} calls this month.")
+    x = min(fl, key=lambda x: abs((_iso(x.get("scheduled_out")) or now) - now))
+    o, de = (x.get("origin") or {}).get("code_iata"), (x.get("destination") or {}).get("code_iata")
+    dep = _iso(x.get("estimated_off")) or _iso(x.get("scheduled_out"))
+    when = f", departs {dep.astimezone(HOME_TZ):%a %I:%M %p}" if dep else ""
+    return True, (f"Key works: {ident} {o} -> {de}, {x.get('status') or 'no status yet'}{when}. "
+                  f"{len(fl)} flight(s) returned; {fa_usage()} calls this month (1 just now).")
 
 
 def fa_test(ident):
