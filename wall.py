@@ -707,6 +707,9 @@ def visitor_zones(origin, dest):
 # ---- FlightAware AeroAPI: live times and delays ------------------------------
 FA_URL = "https://aeroapi.flightaware.com/aeroapi"
 DELAY_SHOW_MIN = 15          # show "DELAYED" / "LATE" from this many minutes
+FINAL_CHECK_MIN = 20         # from this long before the expected landing...
+FINAL_EVERY_S = 180          # ...look the flight up this often until the touchdown is confirmed
+LANDING_GRACE_MIN = 45       # no confirmation this long after the expected landing: call it landed
 LIVE = {}                    # flight key -> latest AeroAPI info (guarded by LOCK)
 FA = {"status": "off", "error": "", "next_try": {}, "backoff_until": 0}
 
@@ -785,18 +788,24 @@ def fa_lookup(f):
                          "scheduled_on", "scheduled_in"),
             "dep_delay": best.get("departure_delay"), "arr_delay": best.get("arrival_delay"),
             "cancelled": bool(best.get("cancelled")), "status": best.get("status") or "",
+            "landed": first("actual_on", "actual_in"),  # only set once it has really touched down
             "ts": time.time()}
 
 
 def fa_interval(f, info, now):
     """Seconds between lookups for this flight, or None if it shouldn't be looked up now:
-    from 24 h before departure, every 3 h until 6 h out, then every 15 min until it lands."""
+    from 24 h before departure, every 3 h until 6 h out, then every 15 min, then every 3 min
+    from 20 min before the expected landing until FlightAware confirms the touchdown."""
     dep = (info or {}).get("start") or f["start"]
     arr = (info or {}).get("end") or f["end"]
-    if not fa_ident(f) or now < dep - timedelta(hours=24) or now > arr + timedelta(minutes=30):
+    if not fa_ident(f) or (info or {}).get("landed") or now < dep - timedelta(hours=24):
         return None
+    if now > arr + timedelta(minutes=LANDING_GRACE_MIN + 15):
+        return None  # gave up waiting for a confirmation
     if (info or {}).get("cancelled"):
         return 3 * 3600
+    if arr - now <= timedelta(minutes=FINAL_CHECK_MIN):
+        return FINAL_EVERY_S
     return 3 * 3600 if dep - now > timedelta(hours=6) else 15 * 60
 
 
@@ -854,7 +863,25 @@ def live(f):
         g.update(start=info["start"], end=info["end"])
     g["dep_delay"] = info["dep_delay"] or 0
     g["arr_delay"] = info["arr_delay"] or 0
+    g["confirmed"] = bool(info.get("landed"))
     return g
+
+
+def landed_at(f):
+    """When the flight counts as landed. Tracked by FlightAware but not confirmed yet: only after
+    the grace period (so an estimate that passes early doesn't say "LANDED" mid-air)."""
+    if f.get("live") and not f.get("confirmed"):
+        return f["end"] + timedelta(minutes=LANDING_GRACE_MIN)
+    return f["end"]
+
+
+def in_air(f, now):
+    return not f.get("cancelled") and f["start"] <= now < landed_at(f)
+
+
+def just_landed(f, now):
+    return (not f.get("cancelled") and landed_at(f) <= now
+            and now < max(landed_at(f), f["end"] + timedelta(minutes=CFG["landed_minutes"])))
 
 
 def late_min(f, which):
@@ -1062,12 +1089,10 @@ def data_loop():
 # ----------------------------------------------------------------------------
 def flight_mode(flights, now):
     """flying / landed / leaving for one group of booked flights, or None."""
-    flown = [f for f in flights if not f.get("cancelled")]
-    for f in flown:
-        if f["start"] <= now < f["end"]:
+    for f in flights:
+        if in_air(f, now):
             return "flying", f
-    recent = [f for f in flown if f["home"] and
-              f["end"] <= now < f["end"] + timedelta(minutes=CFG["landed_minutes"])]
+    recent = [f for f in flights if f["home"] and just_landed(f, now)]
     if recent:
         return "landed", recent[-1]
     soon = timedelta(hours=CFG["leaving_soon_hours"])
@@ -1088,16 +1113,16 @@ def pick_mode(snap, now):
     v = snap.get("visitor")  # temporary override from the settings page
     if v:
         f = v["flight"]
-        if not f.get("cancelled") and f["start"] <= now < f["end"]:
+        if in_air(f, now):
             return "flying", f
-        if not f.get("cancelled") and f["end"] <= now < f["end"] + timedelta(minutes=CFG["landed_minutes"]):
+        if just_landed(f, now):
             return "landed", f
         if now < f["start"]:
             return "visitor", v
     if snap.get("offline"):
         return "offline", snap["offline"]
     if snap["loc"] and snap["loc"]["at_home"]:
-        landed = [f["end"] for f in flown if f["home"] and f["end"] <= now]
+        landed = [f["end"] for f in flown if f["home"] and landed_at(f) <= now]
         if landed and now - max(landed) < timedelta(hours=CFG["home_banner_hours"]):
             return "home", None  # "DADA IS HOME!" for a while after he lands
         return "home_weather", None
@@ -1377,8 +1402,11 @@ def screen_flying(img, d, snap, now, t, f):
 
     left = f["end"] - now
     mins = max(0, int(left.total_seconds() // 60))
-    ctext(d, 42, f"{mins // 60}H {mins % 60:02d}M LEFT" if mins >= 60 else f"{mins} MIN LEFT",
-          small, WHITE)
+    if mins < 1:  # past the expected time: FlightAware hasn't confirmed the touchdown yet
+        ctext(d, 42, "LANDING NOW", small, YELLOW if int(t * 2) % 2 else WHITE)
+    else:
+        ctext(d, 42, f"{mins // 60}H {mins % 60:02d}M LEFT" if mins >= 60 else f"{mins} MIN LEFT",
+              small, WHITE)
     d.line((6, 46, W - 7, 46), fill=DIM)
     if f["home"]:
         msg = "ON THE WAY!" if f.get("visitor") or f.get("friend") else "COMING HOME!"
@@ -1605,6 +1633,9 @@ def demo_scenarios():
          now),
         ("leaving_cancelled", {"loc": loc("Denver", "us-co", True), "wx": None,
                                "flights": [dict(fl("DEN", "SFO", 1.5, 2.4, "UA 552"), live=True, cancelled=True)]},
+         now),
+        ("flying_landing_now", {"loc": loc("Chicago", "us-il"), "wx": None,  # estimate passed, not confirmed
+                                "flights": [dict(fl("ORD", "DEN", -2.8, 2.6, "UA 2211"), live=True, confirmed=False)]},
          now),
         ("flying_home_late", {"loc": loc("Chicago", "us-il"), "wx": None,
                               "flights": [dict(fl("ORD", "DEN", -1.6, 2.6, "UA 2211"), live=True,
